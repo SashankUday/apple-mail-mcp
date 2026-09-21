@@ -229,6 +229,27 @@ server.registerTool(
   }
 );
 
+// ---- list_attachments ----
+server.registerTool(
+  "list_attachments",
+  {
+    description: "List attachment names, MIME types (null when unavailable from Mail), approximate sizes and download status. Call this before save_attachment to obtain the exact attachment_name.",
+    inputSchema: z.object({
+      message_id: z.number().int().nonnegative().safe().describe("ID of the message"),
+      mailbox: z.string().describe("Mailbox containing the message"),
+      account: z.string().describe("Account containing the mailbox"),
+    }),
+  },
+  async ({ message_id, mailbox, account }) => {
+    try {
+      const attachments = await applescript.listAttachments(mailbox, account, message_id);
+      return { content: [{ type: "text", text: JSON.stringify({ count: attachments.length, attachments }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
 // ---- Start server ----
 async function main() {
   const transport = new StdioServerTransport();

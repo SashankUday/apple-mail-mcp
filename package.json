@@ -14,8 +14,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
-    "test": "bun test",
-    "test:clean": "bun test --bail",
+    "test": "npm run build && node --test tests/*.test.cjs",
+    "test:clean": "npm test",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

@@ -63,6 +63,7 @@ The repository's `.mcp.json` uses `build/index.js` relative to the repository ro
 | `list_messages` | List recent messages, optionally unread only |
 | `get_message` | Read an email's full content |
 | `search_messages` | Search by subject or sender |
+| `list_attachments` | List exact attachment names, MIME types (null if unavailable), approximate sizes and download status |
 | `send_email` | Send email with multiple recipients and optional CC/BCC |
 | `get_unread_count` | Get a mailbox or total unread count |
 | `move_message` | Move a message between mailboxes |
@@ -77,7 +78,7 @@ npx tsc --noEmit
 grep -c 'assertAccountAllowed(' src/applescript.ts
 ```
 
-The exclusion patch adds ten explicit account guard calls. The TypeScript check does not exercise Mail.app; live behavior requires separate macOS testing.
+The exclusion patch adds ten explicit account guard calls; attachment listing adds one. The TypeScript check does not exercise Mail.app; live behavior requires separate macOS testing.
 
 `src/applescript.ts` contains Mail operations, `src/index.ts` registers MCP tools, and `src/config.ts` parses and enforces account exclusions.
 

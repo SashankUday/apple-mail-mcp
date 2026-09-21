@@ -426,3 +426,52 @@ tell application "Mail"
 end tell`;
   return runAppleScript(script);
 }
+
+
+export async function listAttachments(
+  mailboxName: string,
+  accountName: string,
+  messageId: number,
+  runner: typeof runAppleScript = runAppleScript
+): Promise<{ name: string; mimeType: string | null; size: number; downloaded: boolean }[]> {
+  assertAccountAllowed(accountName);
+  if (!Number.isSafeInteger(messageId) || messageId < 0) throw new Error("Invalid message id");
+  const safeMb = sanitize(mailboxName);
+  const safeAcct = sanitize(accountName);
+  const script = `
+tell application "Mail"
+  set mb to mailbox "${safeMb}" of account "${safeAcct}"
+  set matchedMsgs to (every message of mb whose id is ${messageId})
+  if (count of matchedMsgs) is 0 then
+    error "Message not found with id: ${messageId}"
+  end if
+  set m to item 1 of matchedMsgs
+  set attList to {}
+  repeat with att in mail attachments of m
+    set attName to name of att
+    if attName contains "${RECORD_DELIM}" then error "Attachment name contains an unsupported record delimiter"
+    -- Some Mail versions advertise MIME type but raise -10000 when it is read.
+    -- Preserve usable metadata and report an unknown type instead of guessing.
+    set attMime to ""
+    try
+      set attMime to MIME type of att
+    end try
+    set end of attList to attName & "${FIELD_DELIM}" & attMime & "${FIELD_DELIM}" & (file size of att as text) & "${FIELD_DELIM}" & (downloaded of att as text)
+  end repeat
+  set AppleScript's text item delimiters to "${RECORD_DELIM}"
+  return attList as text
+end tell`;
+  const raw = await runner(script);
+  if (!raw) return [];
+  return raw.split(RECORD_DELIM).map((record) => {
+    const fields = record.split(FIELD_DELIM);
+    const downloaded = fields.pop();
+    const size = Number(fields.pop());
+    const mimeType = fields.pop();
+    if (!fields.length || mimeType === undefined || !Number.isFinite(size) || size < 0 ||
+        (downloaded !== "true" && downloaded !== "false")) {
+      throw new Error("Invalid attachment metadata returned by Mail");
+    }
+    return { name: fields.join(FIELD_DELIM), mimeType: mimeType || null, size, downloaded: downloaded === "true" };
+  });
+}
