@@ -1,56 +1,88 @@
-# @griches/apple-mail-mcp
+# Apple Mail MCP fork
 
-An [MCP](https://modelcontextprotocol.io) server that gives AI assistants access to Apple Mail on macOS via AppleScript.
+This fork of [griches/apple-mcp](https://github.com/griches/apple-mcp) contains only the Apple Mail package. It provides an [MCP](https://modelcontextprotocol.io) server that controls Mail.app on macOS through AppleScript, with account exclusion added in this fork. The Notes, Messages, Contacts, Reminders, Calendar and Maps packages are not included.
 
-## Quick Start
+## Requirements and setup
 
-```bash
-npx @griches/apple-mail-mcp
-```
-
-## Tools
-
-| Tool | Description |
-|------|-------------|
-| `list_mailboxes` | List all mailboxes across accounts with unread counts |
-| `list_messages` | List recent messages in a mailbox, optionally filtered to unread only |
-| `get_message` | Get the full content of an email by ID |
-| `search_messages` | Search emails by subject or sender across mailboxes |
-| `send_email` | Send an email with optional CC/BCC (supports multiple recipients) |
-| `get_unread_count` | Get unread count for a mailbox or all mailboxes |
-| `move_message` | Move an email to a different mailbox |
-| `mark_read` | Mark an email as read or unread |
-| `delete_message` | Delete an email (moves to trash) |
-| `flag_message` | Flag or unflag an email message |
-
-## Configuration
-
-### Claude Code
+- macOS with Apple Mail configured
+- Node.js 18+ and npm
+- macOS Automation permission for the process running the server to control Mail
 
 ```bash
-claude mcp add apple-mail -- npx @griches/apple-mail-mcp
+git clone https://github.com/SashankUday/apple-mail-mcp.git
+cd apple-mail-mcp
+npm install
+npm run build
+node build/index.js --exclude-accounts "Personal Gmail,iCloud"
 ```
 
-### Claude Desktop
+Run this fork from its local build. The upstream npm package `@griches/apple-mail-mcp` does not include this fork's account-exclusion changes.
 
-Add to your `claude_desktop_config.json`:
+## Account exclusion
+
+Configure excluded accounts by their names in Mail:
+
+```bash
+node build/index.js --exclude-accounts "Personal Gmail,iCloud"
+node build/index.js --exclude-accounts="Personal Gmail" --exclude-accounts=iCloud
+APPLE_MAIL_EXCLUDE_ACCOUNTS="Personal Gmail,iCloud" node build/index.js
+```
+
+CLI and environment lists are merged. Names are trimmed, matched case-insensitively and deduplicated. No accounts are excluded by default. The server logs its configured exclusions to stderr at startup; a misspelled or renamed account will not match.
+
+Enumeration skips excluded accounts in mailbox listings, unscoped searches and total unread counts. Operations explicitly naming an excluded account fail before AppleScript runs. Message moves check both source and destination. Mailbox listings and search results also receive a TypeScript filter as a second check.
+
+This is an application-level filter, not a macOS permission boundary. The existing `send_email` tool checks an explicitly supplied `from_account`; omitting that parameter leaves sender selection to Mail and does not check the default account against the exclusion list. This fork currently has no draft tool or additional approval gate for sending.
+
+## MCP client configuration
+
+Point your client at the built entry point using an absolute path:
 
 ```json
 {
   "mcpServers": {
     "apple-mail": {
-      "command": "npx",
-      "args": ["@griches/apple-mail-mcp"]
+      "command": "node",
+      "args": [
+        "/absolute/path/to/apple-mail-mcp/build/index.js",
+        "--exclude-accounts",
+        "Personal Gmail,iCloud"
+      ]
     }
   }
 }
 ```
 
-## Requirements
+The repository's `.mcp.json` uses `build/index.js` relative to the repository root. Build before launching, and configure your own exclusions before using it.
 
-- **macOS** (uses AppleScript)
-- **Node.js** 18+
+## Tools
 
-## License
+| Tool | Description |
+| --- | --- |
+| `list_mailboxes` | List mailboxes and unread counts across allowed accounts |
+| `list_messages` | List recent messages, optionally unread only |
+| `get_message` | Read an email's full content |
+| `search_messages` | Search by subject or sender |
+| `send_email` | Send email with multiple recipients and optional CC/BCC |
+| `get_unread_count` | Get a mailbox or total unread count |
+| `move_message` | Move a message between mailboxes |
+| `mark_read` | Mark a message read or unread |
+| `delete_message` | Move a message to trash |
+| `flag_message` | Flag or unflag a message |
 
-MIT — see the [main repository](https://github.com/griches/apple-mcp) for full details.
+## Development
+
+```bash
+npx tsc --noEmit
+grep -c 'assertAccountAllowed(' src/applescript.ts
+```
+
+The exclusion patch adds ten explicit account guard calls. The TypeScript check does not exercise Mail.app; live behavior requires separate macOS testing.
+
+`src/applescript.ts` contains Mail operations, `src/index.ts` registers MCP tools, and `src/config.ts` parses and enforces account exclusions.
+
+## Upstream credit and license
+
+The original Apple Mail implementation is by griches in [griches/apple-mcp](https://github.com/griches/apple-mcp), whose package metadata declares MIT licensing. This fork retains that declaration and credits the upstream project. The cloned repository did not contain a standalone `LICENSE` file.
+
+The `upstream` Git remote points to `https://github.com/griches/apple-mcp.git` for tracking future changes.
