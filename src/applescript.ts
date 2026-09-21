@@ -1,3 +1,6 @@
+import { constants as fsConstants, chmodSync, copyFileSync, lstatSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { execFile } from "node:child_process";
 import { EXCLUDED_ACCOUNTS, assertAccountAllowed, filterExcluded } from "./config.js";
 
@@ -474,4 +477,109 @@ end tell`;
     }
     return { name: fields.join(FIELD_DELIM), mimeType: mimeType || null, size, downloaded: downloaded === "true" };
   });
+}
+
+
+export function validateAttachmentName(name: string): void {
+  if (!name || /[/\\\0]/.test(name) || name.includes("..") || name.startsWith(".")) {
+    throw new Error("Invalid attachment name: empty, hidden, traversal and path separator names are not allowed");
+  }
+}
+
+export function validateAttachmentDirectory(savePath: string): string {
+  if (!isAbsolute(savePath)) throw new Error("save_path must be an absolute path to an existing directory");
+  const hasHiddenSegment = (path: string): boolean => path.split(sep).some((part) => part.startsWith("."));
+  if (hasHiddenSegment(savePath)) throw new Error("Saving into hidden directories is not allowed");
+  const directory = realpathSync.native(savePath);
+  if (!statSync(directory).isDirectory()) throw new Error("save_path must be an existing directory");
+  if (hasHiddenSegment(directory)) throw new Error("Saving into hidden directories is not allowed");
+
+  const within = (path: string, root: string): boolean => {
+    const rel = relative(root, path);
+    return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  };
+  // Check canonical paths and case-fold the deny root as additional protection on APFS.
+  const home = realpathSync.native(homedir());
+  const keychains = join(home, "Library", "Keychains");
+  if (within(directory.toLowerCase(), keychains.toLowerCase()) ||
+      within(resolve(savePath).toLowerCase(), keychains.toLowerCase())) {
+    throw new Error("Saving into Library/Keychains is not allowed");
+  }
+  const configured = process.env.APPLE_MAIL_ATTACHMENT_SAVE_ROOTS;
+  const roots = configured === undefined ? [home, "/Volumes", tmpdir()] : configured.split(":").filter(Boolean);
+  const allowed = roots.some((root) => {
+    if (!isAbsolute(root)) throw new Error("APPLE_MAIL_ATTACHMENT_SAVE_ROOTS must contain absolute directories");
+    try {
+      const canonicalRoot = realpathSync.native(root);
+      return statSync(canonicalRoot).isDirectory() && within(directory, canonicalRoot);
+    } catch {
+      // A missing default volume/temp root must not disable another valid root.
+      return false;
+    }
+  });
+  if (!allowed) throw new Error("save_path is outside the allowed attachment save roots");
+  return directory;
+}
+
+export async function saveAttachment(
+  mailboxName: string,
+  accountName: string,
+  messageId: number,
+  attachmentName: string,
+  savePath: string,
+  runner: typeof runAppleScript = runAppleScript
+): Promise<{ savedPath: string; bytes: number }> {
+  assertAccountAllowed(accountName);
+  validateAttachmentName(attachmentName);
+  if (!Number.isSafeInteger(messageId) || messageId < 0) throw new Error("Invalid message id");
+  const directory = validateAttachmentDirectory(savePath);
+  const directoryStat = statSync(directory);
+  const finalPath = join(directory, attachmentName);
+  const staging = mkdtempSync(join(directory, ".apple-mail-attachment-"));
+  const staged = join(staging, "attachment");
+  try {
+    chmodSync(staging, 0o700);
+    const script = `
+tell application "Mail"
+  set mb to mailbox "${sanitize(mailboxName)}" of account "${sanitize(accountName)}"
+  set matchedMsgs to (every message of mb whose id is ${messageId})
+  if (count of matchedMsgs) is 0 then
+    error "Message not found with id: ${messageId}"
+  end if
+  set m to item 1 of matchedMsgs
+  considering case
+    set matchingAttachments to (every mail attachment of m whose name is "${sanitize(attachmentName)}")
+  end considering
+  if (count of matchingAttachments) is 0 then error "Attachment not found: ${sanitize(attachmentName)}"
+  if (count of matchingAttachments) > 1 then error "Multiple attachments have this name; cannot select one unambiguously"
+  set att to item 1 of matchingAttachments
+  if not (downloaded of att) then error "Attachment is not downloaded locally: ${sanitize(attachmentName)}; open it in Mail first"
+  save att in POSIX file "${sanitize(staged)}"
+end tell`;
+    await runner(script);
+    const stagedStat = lstatSync(staged);
+    if (!stagedStat.isFile()) throw new Error("Mail did not save a regular attachment file");
+    chmodSync(staged, 0o600);
+    const currentDirectory = validateAttachmentDirectory(savePath);
+    const currentStat = statSync(currentDirectory);
+    if (currentDirectory !== directory || currentStat.dev !== directoryStat.dev || currentStat.ino !== directoryStat.ino) {
+      throw new Error("Destination directory changed while saving attachment");
+    }
+    try {
+      copyFileSync(staged, finalPath, fsConstants.COPYFILE_EXCL);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error(`Destination already exists; refusing to overwrite: ${finalPath}`);
+      }
+      throw err;
+    }
+    chmodSync(finalPath, 0o600);
+    return { savedPath: finalPath, bytes: statSync(finalPath).size };
+  } finally {
+    try {
+      rmSync(staging, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup must not hide the original Mail/filesystem error.
+    }
+  }
 }

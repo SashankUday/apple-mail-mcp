@@ -64,12 +64,21 @@ The repository's `.mcp.json` uses `build/index.js` relative to the repository ro
 | `get_message` | Read an email's full content |
 | `search_messages` | Search by subject or sender |
 | `list_attachments` | List exact attachment names, MIME types (null if unavailable), approximate sizes and download status |
+| `save_attachment` | Save one downloaded attachment to an existing allowed directory, without overwriting |
 | `send_email` | Send email with multiple recipients and optional CC/BCC |
 | `get_unread_count` | Get a mailbox or total unread count |
 | `move_message` | Move a message between mailboxes |
 | `mark_read` | Mark a message read or unread |
 | `delete_message` | Move a message to trash |
 | `flag_message` | Flag or unflag a message |
+
+## Saving attachments
+
+Call `list_attachments` first, then pass its exact `attachment_name` to `save_attachment` along with `message_id`, `mailbox`, `account` and an absolute `save_path` naming an existing directory. The result contains `savedPath` and the actual `bytes` saved. Size reported by listing is approximate; `downloaded: false` means the attachment must first be opened/downloaded in Mail.
+
+Allowed destination roots default to the home directory, `/Volumes`, and Node's system temporary directory. Override them with `APPLE_MAIL_ATTACHMENT_SAVE_ROOTS` (colon-separated absolute directories). An empty value permits no destinations. Hidden directories, symlinks resolving outside allowed roots, and `~/Library/Keychains` are denied even with custom roots. Empty/hidden filenames and names containing separators, null bytes or `..` are rejected. Existing files are never overwritten; choose another directory or filename in a separate user-directed action.
+
+Files are staged privately in the destination directory, copied with exclusive creation, and restricted to mode `600`. No new dependencies are required. Attachments with duplicate names in one message are rejected as ambiguous. The implementation uses Mail's attachment interface only; some attachments may not be exposed by it. When Mail cannot supply its advertised MIME type property, listing returns `mimeType: null` rather than guessing.
 
 ## Development
 
@@ -78,7 +87,7 @@ npx tsc --noEmit
 grep -c 'assertAccountAllowed(' src/applescript.ts
 ```
 
-The exclusion patch adds ten explicit account guard calls; attachment listing adds one. The TypeScript check does not exercise Mail.app; live behavior requires separate macOS testing.
+The exclusion patch adds ten explicit account guard calls; the two attachment tools add one each (12 total before drafting). The TypeScript check does not exercise Mail.app; live behavior requires separate macOS testing.
 
 `src/applescript.ts` contains Mail operations, `src/index.ts` registers MCP tools, and `src/config.ts` parses and enforces account exclusions.
 

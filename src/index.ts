@@ -250,6 +250,29 @@ server.registerTool(
   }
 );
 
+// ---- save_attachment ----
+server.registerTool(
+  "save_attachment",
+  {
+    description: "Save one downloaded attachment to disk without overwriting. Call list_attachments first for its exact name. save_path must be an absolute directory that already exists, within the configured allowed roots. Returns the saved path and byte count.",
+    inputSchema: z.object({
+      message_id: z.number().int().nonnegative().safe().describe("ID of the message"),
+      mailbox: z.string().describe("Mailbox containing the message"),
+      account: z.string().describe("Account containing the mailbox"),
+      attachment_name: z.string().describe("Exact attachment name from list_attachments"),
+      save_path: z.string().describe("Absolute path to an existing destination directory"),
+    }),
+  },
+  async ({ message_id, mailbox, account, attachment_name, save_path }) => {
+    try {
+      const result = await applescript.saveAttachment(mailbox, account, message_id, attachment_name, save_path);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
 // ---- Start server ----
 async function main() {
   const transport = new StdioServerTransport();
