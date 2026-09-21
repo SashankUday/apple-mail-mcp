@@ -32,7 +32,7 @@ CLI and environment lists are merged. Names are trimmed, matched case-insensitiv
 
 Enumeration skips excluded accounts in mailbox listings, unscoped searches and total unread counts. Operations explicitly naming an excluded account fail before AppleScript runs. Message moves check both source and destination. Mailbox listings and search results also receive a TypeScript filter as a second check.
 
-This is an application-level filter, not a macOS permission boundary. The existing `send_email` tool checks an explicitly supplied `from_account`; omitting that parameter leaves sender selection to Mail and does not check the default account against the exclusion list. This fork currently has no draft tool or additional approval gate for sending.
+This is an application-level filter, not a macOS permission boundary. The existing `send_email` tool checks an explicitly supplied `from_account`; omitting that parameter leaves sender selection to Mail and does not check the default account against the exclusion list. The new `create_draft` tool checks both explicitly named and resolved default accounts before creating a draft. The existing `send_email` tool still has no additional approval gate.
 
 ## MCP client configuration
 
@@ -65,12 +65,21 @@ The repository's `.mcp.json` uses `build/index.js` relative to the repository ro
 | `search_messages` | Search by subject or sender |
 | `list_attachments` | List exact attachment names, MIME types (null if unavailable), approximate sizes and download status |
 | `save_attachment` | Save one downloaded attachment to an existing allowed directory, without overwriting |
+| `create_draft` | Save an unsent draft for review in Mail (default for composing) |
 | `send_email` | Send email with multiple recipients and optional CC/BCC |
 | `get_unread_count` | Get a mailbox or total unread count |
 | `move_message` | Move a message between mailboxes |
 | `mark_read` | Mark a message read or unread |
 | `delete_message` | Move a message to trash |
 | `flag_message` | Flag or unflag a message |
+
+## Drafting mail
+
+Use `create_draft` for composition by default. It takes `to`, `subject`, `body`, optional `cc`/`bcc` (comma-separated), and optional `from_account` (a Mail account name). It saves without sending and returns a confirmation naming the account's Drafts mailbox. Review the draft in Mail and send it yourself. `send_email` is for a direct user instruction to send.
+
+An explicit account uses its first configured email address as the sender. Omission resolves Mail's `primary email` to one account and checks it against exclusions before creating anything; an unresolved or ambiguous default requires `from_account`. This uses the dictionary's primary email, rather than Mail's context-sensitive automatic sender selection. Live testing selected `visible:false`: both modes saved successfully, but the visible multi-recipient trial included an unexpected extra recipient. Invisible drafts passed exact recipient checks and remained in Drafts after closing.
+
+`send_email` remains unchanged. Its existing `make new outgoing message of account ...` construction is inconsistent with Mail's dictionary (outgoing messages belong to the application); a separate fix should resolve the account address and set `sender`, and check default-account exclusion as drafting does.
 
 ## Saving attachments
 
@@ -84,10 +93,11 @@ Files are staged privately in the destination directory, copied with exclusive c
 
 ```bash
 npx tsc --noEmit
+npm test
 grep -c 'assertAccountAllowed(' src/applescript.ts
 ```
 
-The exclusion patch adds ten explicit account guard calls; the two attachment tools add one each (12 total before drafting). The TypeScript check does not exercise Mail.app; live behavior requires separate macOS testing.
+The exclusion patch adds ten explicit account guard calls; the two attachment tools add one each and drafting adds two (explicit and resolved account), for 14 total. The TypeScript check does not exercise Mail.app. See [verification results](docs/verification.md) for automated coverage, live checks and remaining limitations.
 
 `src/applescript.ts` contains Mail operations, `src/index.ts` registers MCP tools, and `src/config.ts` parses and enforces account exclusions.
 

@@ -93,6 +93,34 @@ server.registerTool(
   }
 );
 
+// ---- create_draft ----
+server.registerTool(
+  "create_draft",
+  {
+    description: "Create and save an unsent draft for review in Apple Mail. This is the default tool for composing mail. Use send_email only when the user directly instructs you to send.",
+    inputSchema: z.object({
+      to: z.string().describe("Recipient email address (comma-separated for multiple recipients)"),
+      subject: z.string().describe("Email subject"),
+      body: z.string().describe("Email body text"),
+      cc: z.string().optional().describe("CC recipient email address (comma-separated for multiple)"),
+      bcc: z.string().optional().describe("BCC recipient email address (comma-separated for multiple)"),
+      from_account: z.string().optional().describe("Mail account name for the draft (uses the primary email account if omitted)"),
+    }),
+  },
+  async ({ to, subject, body, cc, bcc, from_account }) => {
+    try {
+      const result = await applescript.createDraft(to, subject, body, {
+        cc,
+        bcc,
+        from: from_account,
+      });
+      return { content: [{ type: "text", text: result }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
 // ---- send_email ----
 server.registerTool(
   "send_email",

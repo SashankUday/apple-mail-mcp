@@ -304,6 +304,73 @@ end tell`;
   return runAppleScript(script);
 }
 
+export async function createDraft(
+  to: string,
+  subject: string,
+  body: string,
+  options?: { cc?: string; bcc?: string; from?: string },
+  runner: typeof runAppleScript = runAppleScript
+): Promise<string> {
+  assertAccountAllowed(options?.from);
+  // Resolve the sender before creating anything, including when Mail's default is used.
+  const accountLookup = options?.from
+    ? `set chosenAccount to account "${sanitize(options.from.trim())}"
+  set addresses to email addresses of chosenAccount
+  if (count of addresses) is 0 then error "Account has no email address"
+  set chosenAddress to item 1 of addresses`
+    : `set chosenAddress to primary email
+  set matchingAccounts to {}
+  repeat with acct in accounts
+    if (email addresses of acct) contains chosenAddress then set end of matchingAccounts to acct
+  end repeat
+  if (count of matchingAccounts) is not 1 then error "Cannot resolve default account; specify from_account"
+  set chosenAccount to item 1 of matchingAccounts`;
+  const resolved = await runner(`
+tell application "Mail"
+  ${accountLookup}
+  return (name of chosenAccount) & "${FIELD_DELIM}" & chosenAddress
+end tell`);
+  const fields = resolved.split(FIELD_DELIM);
+  if (fields.length !== 2 || !fields[0] || !fields[1]) throw new Error("Cannot resolve draft account and email address");
+  const [accountName, address] = fields;
+  assertAccountAllowed(accountName);
+  const safeSubject = sanitize(subject);
+  const safeBody = sanitize(body);
+
+  // Support multiple comma-separated recipients
+  const toAddresses = to.split(",").map((a) => a.trim()).filter(Boolean);
+  let recipientBlock = toAddresses
+    .map((addr) => `make new to recipient at end of to recipients with properties {address:"${sanitize(addr)}"}`)
+    .join("\n    ");
+
+  if (options?.cc) {
+    const ccAddresses = options.cc.split(",").map((a) => a.trim()).filter(Boolean);
+    recipientBlock += "\n    " + ccAddresses
+      .map((addr) => `make new cc recipient at end of cc recipients with properties {address:"${sanitize(addr)}"}`)
+      .join("\n    ");
+  }
+  if (options?.bcc) {
+    const bccAddresses = options.bcc.split(",").map((a) => a.trim()).filter(Boolean);
+    recipientBlock += "\n    " + bccAddresses
+      .map((addr) => `make new bcc recipient at end of bcc recipients with properties {address:"${sanitize(addr)}"}`)
+      .join("\n    ");
+  }
+
+  // macOS 27 / Mail live test: both visibility modes persisted after save and close.
+  // visible:true produced an extra recipient in the multi-recipient trial; false
+  // preserved the exact To/CC/BCC lists. Review the saved message in Drafts.
+  const script = `
+tell application "Mail"
+  set newMessage to make new outgoing message with properties {sender:"${sanitize(address)}", subject:"${safeSubject}", content:"${safeBody}", visible:false}
+  tell newMessage
+    ${recipientBlock}
+  end tell
+  save newMessage
+  return "Draft saved in Drafts for ${sanitize(accountName)}: ${safeSubject}"
+end tell`;
+  return runner(script);
+}
+
 export async function getUnreadCount(mailboxName?: string, accountName?: string): Promise<number> {
   let script: string;
   if (mailboxName && accountName) {
