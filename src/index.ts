@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import * as applescript from "./applescript.js";
+import { EXCLUDED_ACCOUNTS } from "./config.js";
 
 const server = new McpServer({
   name: "apple-mail",
@@ -233,6 +234,13 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("Apple Mail MCP server running on stdio");
+  // Echo the exclusion list to stderr so a misspelled account name is visible
+  // in the client's MCP log rather than silently excluding nothing.
+  if (EXCLUDED_ACCOUNTS.length > 0) {
+    console.error(`Excluded accounts (${EXCLUDED_ACCOUNTS.length}): ${EXCLUDED_ACCOUNTS.join(", ")}`);
+  } else {
+    console.error("No account exclusions configured.");
+  }
 }
 
 main().catch((err) => {

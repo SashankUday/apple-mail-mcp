@@ -1,4 +1,23 @@
 import { execFile } from "node:child_process";
+import { EXCLUDED_ACCOUNTS, assertAccountAllowed, filterExcluded } from "./config.js";
+
+/**
+ * AppleScript guard skipping excluded accounts inside an account loop.
+ *
+ * Emitted as a matched pair around the loop body. Returns empty strings when
+ * nothing is excluded, so the generated script is byte-identical to the
+ * upstream one in the default configuration — the feature costs nothing when
+ * unused, and a script regression can't be blamed on it.
+ *
+ * Relies on `acctName` already being bound in the enclosing scope. AppleScript
+ * string comparison ignores case unless wrapped in `considering case`, which
+ * matches the case-insensitive test in config.ts.
+ */
+export function accountGuard(variable = "acctName"): { open: string; close: string } {
+  if (EXCLUDED_ACCOUNTS.length === 0) return { open: "", close: "" };
+  const tests = EXCLUDED_ACCOUNTS.map((name) => `${variable} is "${sanitize(name)}"`).join(" or ");
+  return { open: `if not (${tests}) then`, close: "end if" };
+}
 
 export function sanitize(input: string): string {
   return input
@@ -25,26 +44,30 @@ const FIELD_DELIM = "|||";
 const RECORD_DELIM = "<<<>>>";
 
 export async function listMailboxes(): Promise<{ name: string; account: string; unreadCount: number }[]> {
+  const guard = accountGuard();
   const script = `
 tell application "Mail"
   set mbList to {}
   repeat with acct in accounts
     set acctName to name of acct
+    ${guard.open}
     repeat with mb in mailboxes of acct
       set mbName to name of mb
       set mbUnread to unread count of mb
       set end of mbList to mbName & "${FIELD_DELIM}" & acctName & "${FIELD_DELIM}" & (mbUnread as text)
     end repeat
+    ${guard.close}
   end repeat
   set AppleScript's text item delimiters to "${RECORD_DELIM}"
   return mbList as text
 end tell`;
   const raw = await runAppleScript(script);
   if (!raw) return [];
-  return raw.split(RECORD_DELIM).map((record) => {
+  const rows = raw.split(RECORD_DELIM).map((record) => {
     const [name, account, unreadCount] = record.split(FIELD_DELIM).map((s) => s.trim());
     return { name, account, unreadCount: parseInt(unreadCount, 10) || 0 };
   });
+  return filterExcluded(rows);
 }
 
 export async function listMessages(
@@ -53,6 +76,7 @@ export async function listMessages(
   limit?: number,
   unreadOnly?: boolean
 ): Promise<{ id: number; subject: string; sender: string; date: string; isRead: boolean }[]> {
+  assertAccountAllowed(accountName);
   const safeMb = sanitize(mailboxName);
   const safeAcct = sanitize(accountName);
   const maxMessages = limit || 25;
@@ -117,6 +141,7 @@ export async function getMessage(
   toRecipients: string[];
   ccRecipients: string[];
 }> {
+  assertAccountAllowed(accountName);
   const safeMb = sanitize(mailboxName);
   const safeAcct = sanitize(accountName);
   const script = `
@@ -176,6 +201,7 @@ export async function searchMessages(
 
   let script: string;
   if (mailboxName && accountName) {
+    assertAccountAllowed(accountName);
     const safeMb = sanitize(mailboxName);
     const safeAcct = sanitize(accountName);
     script = `
@@ -194,12 +220,14 @@ tell application "Mail"
   return results as text
 end tell`;
   } else {
+    const guard = accountGuard();
     script = `
 tell application "Mail"
   set results to {}
   set resultCount to 0
   repeat with acct in accounts
     set acctName to name of acct
+    ${guard.open}
     repeat with mb in mailboxes of acct
       set mbName to name of mb
       set matchedMsgs to (every message of mb whose ${field} contains "${safeQuery}")
@@ -210,6 +238,7 @@ tell application "Mail"
       end repeat
       if resultCount >= ${maxResults} then exit repeat
     end repeat
+    ${guard.close}
     if resultCount >= ${maxResults} then exit repeat
   end repeat
   set AppleScript's text item delimiters to "${RECORD_DELIM}"
@@ -218,10 +247,11 @@ end tell`;
   }
   const raw = await runAppleScript(script);
   if (!raw) return [];
-  return raw.split(RECORD_DELIM).map((record) => {
+  const rows = raw.split(RECORD_DELIM).map((record) => {
     const [id, subject, sender, date, mailbox, account] = record.split(FIELD_DELIM).map((s) => s.trim());
     return { id: parseInt(id, 10), subject, sender, date, mailbox, account };
   });
+  return filterExcluded(rows);
 }
 
 export async function sendEmail(
@@ -230,6 +260,7 @@ export async function sendEmail(
   body: string,
   options?: { cc?: string; bcc?: string; from?: string }
 ): Promise<string> {
+  assertAccountAllowed(options?.from);
   const safeSubject = sanitize(subject);
   const safeBody = sanitize(body);
 
@@ -273,6 +304,7 @@ end tell`;
 export async function getUnreadCount(mailboxName?: string, accountName?: string): Promise<number> {
   let script: string;
   if (mailboxName && accountName) {
+    assertAccountAllowed(accountName);
     const safeMb = sanitize(mailboxName);
     const safeAcct = sanitize(accountName);
     script = `
@@ -280,13 +312,17 @@ tell application "Mail"
   return unread count of mailbox "${safeMb}" of account "${safeAcct}"
 end tell`;
   } else {
+    const guard = accountGuard();
     script = `
 tell application "Mail"
   set totalUnread to 0
   repeat with acct in accounts
+    set acctName to name of acct
+    ${guard.open}
     repeat with mb in mailboxes of acct
       set totalUnread to totalUnread + (unread count of mb)
     end repeat
+    ${guard.close}
   end repeat
   return totalUnread
 end tell`;
@@ -302,6 +338,8 @@ export async function moveMessage(
   toMailbox: string,
   toAccount?: string
 ): Promise<string> {
+  assertAccountAllowed(fromAccount);
+  assertAccountAllowed(toAccount);
   const safeFromMb = sanitize(fromMailbox);
   const safeFromAcct = sanitize(fromAccount);
   const safeToMb = sanitize(toMailbox);
@@ -327,6 +365,7 @@ export async function markRead(
   accountName: string,
   read: boolean
 ): Promise<string> {
+  assertAccountAllowed(accountName);
   const safeMb = sanitize(mailboxName);
   const safeAcct = sanitize(accountName);
   const script = `
@@ -348,6 +387,7 @@ export async function deleteMessage(
   mailboxName: string,
   accountName: string
 ): Promise<string> {
+  assertAccountAllowed(accountName);
   const safeMb = sanitize(mailboxName);
   const safeAcct = sanitize(accountName);
   const script = `
@@ -370,6 +410,7 @@ export async function flagMessage(
   accountName: string,
   flagged: boolean
 ): Promise<string> {
+  assertAccountAllowed(accountName);
   const safeMb = sanitize(mailboxName);
   const safeAcct = sanitize(accountName);
   const script = `
