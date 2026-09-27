@@ -33,11 +33,11 @@ The Gmail check sampled the 100 most recent `INBOX` messages. Nine attachment-be
 
 ## Automated checks
 
-Final run: `npx tsc --noEmit` passed; all 21 tests passed. The complete source has 14 account guard calls.
+Final run on 27 September 2026: `npm test` rebuilt the project and all 23 tests passed. The complete source has 14 account guard calls.
 
 `npm test` builds TypeScript and runs Node's built-in test runner; tests do not require Mail.app. Coverage includes exclusion-before-runner ordering, escaped account/mailbox names, message-id validation, attachment metadata parsing, path confinement and symlink escapes, case-respelled denied paths, filename validation, exact 10 MiB byte preservation, private permissions, overwrite races, existing destination symlinks, and staging cleanup after success and failure.
 
-The two attachment functions add exactly two account guard calls to the original ten. No dependencies were added. `sendEmail`, `getMessage` and account-exclusion configuration are unchanged.
+The two attachment functions add exactly two account guard calls to the original ten. No dependencies were added. `sendEmail` and account-exclusion configuration are unchanged. `getMessage` now removes the single terminal space exposed by Mail's HTML-to-text bridge for native-composer drafts; it does not trim Inbox messages or the distinct AppleScript wrapper form.
 
 
 ## Drafts
@@ -54,8 +54,16 @@ Mail's dictionary declares outgoing messages at application scope and provides a
 | visible:false versus visible:true | Both persisted immediately after save and after closing with saving. The visible multi-recipient trial included an extra one-character recipient; invisible trials preserved requested lists, so the final implementation uses false |
 | Open and send by hand | Not completed: no email sent. UI verification unavailable because Computer Use permissions were not granted |
 
+### Leading-blank-line regression
+
+Raw MIME inspection confirmed the cause on Mail 16: assigning `content` through AppleScript serializes the body inside an `Apple-Mail-URLShareWrapperClass` blockquote and prepends `Apple-Mail-URLShareUserContentTopClass` containing `<br>`. Creating the outgoing message first, clearing `message signature`, assigning content separately, switching temporarily to plain text, and post-save text mutation all retained that wrapper.
+
+For `President Email`, `createDraft` now opens Mail's native `mailto:` composer, captures the existing window and same-subject draft state, waits until the new draft is observable in `President Email > Drafts`, then closes the exact newly opened window. The saved native draft has no URL-share wrapper or leading HTML break. Since macOS Mail ignores a `mailto:` `from` parameter, this path is account-opt-in through `APPLE_MAIL_NATIVE_DRAFT_ACCOUNTS`; other accounts keep the sender-explicit AppleScript path rather than risk saving under the wrong account.
+
+The final live test used `Hi team,\n\n- Alpha\n- Beta\n\nRegards`. `getMessage` returned an exact byte-for-byte string match, the raw MIME contained no `Apple-Mail-URLShare` marker, and the content neither began with a newline nor ended with `" \n"`. The draft was moved to Trash after verification, and no email was sent. Auto-save verification uses a stable before/after same-subject count because Mail can invalidate individual draft IDs while IMAP synchronization is in progress.
+
 Four clearly labelled `[MCP TEST]` drafts were created during live checks, including the final `Ready for review` draft. On 21 September 2026, all four were moved from Drafts to Mail's Trash without sending; this included the visible trial with the unexpected recipient.
 
 `createDraft` starts with the explicit account guard and also checks the resolved account before creating a message. Sender lookup is read-only. The generated creation script uses `save newMessage`; a source grep and generated-script assertions found no `send ` command. The recipient construction is copied from `sendEmail` unchanged: each comma-delimited address deterministically becomes one `make new ... recipient` statement, with no later character-level splitting. The extra one-character row therefore was not produced by that construction. The leading hypothesis is Mail's live compose UI tokenising a transient placeholder as an additional recipient when `visible:true`; this is reasoning from the shared script and the visibility A/B result, not a confirmed root cause. Because `sendEmail` uses the same construction with `visible:false`, and invisible draft trials preserved the exact lists, the evidence suggests `sendEmail` is unaffected, but it was not live-tested by sending mail.
 
-Final automated checks also connect a real MCP client over stdio, verify all new tools and field descriptions, and exercise excluded-account error responses without invoking Mail. The default-account lookup uses the dictionary's `primary email`, not Mail's contextual automatic sender selection. It currently returns the resolved account name and primary address to the TypeScript process before the exclusion guard rejects the account. No message is created, but this means an excluded default account's own address is disclosed internally; a stricter implementation would reject inside AppleScript before returning the address. No publish or push was performed as part of verification.
+Final automated checks also connect a real MCP client over stdio, verify all new tools and field descriptions, and exercise excluded-account error responses without invoking Mail. The default-account lookup uses the dictionary's `primary email`, not Mail's contextual automatic sender selection. It currently returns the resolved account name and primary address to the TypeScript process before the exclusion guard rejects the account. No message is created, but this means an excluded default account's own address is disclosed internally; a stricter implementation would reject inside AppleScript before returning the address.

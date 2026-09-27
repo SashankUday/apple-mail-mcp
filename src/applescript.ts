@@ -43,6 +43,52 @@ export function runAppleScript(script: string): Promise<string> {
   });
 }
 
+function openMailUrl(url: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile("open", ["-a", "Mail", url], (error, _stdout, stderr) => {
+      if (error) {
+        reject(new Error(`Could not open Mail composer: ${stderr || error.message}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+const NATIVE_DRAFT_ACCOUNTS = new Set(
+  (process.env.APPLE_MAIL_NATIVE_DRAFT_ACCOUNTS || "President Email")
+    .split(",")
+    .map((name) => name.trim().toLocaleLowerCase())
+    .filter(Boolean)
+);
+
+export function buildMailtoUrl(
+  to: string[],
+  subject: string,
+  body: string,
+  cc: string[] = [],
+  bcc: string[] = []
+): string {
+  const query: [string, string][] = [["subject", subject], ["body", body]];
+  if (cc.length > 0) query.push(["cc", cc.join(",")]);
+  if (bcc.length > 0) query.push(["bcc", bcc.join(",")]);
+  const encodedQuery = query
+    .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
+    .join("&");
+  return `mailto:${to.map(encodeURIComponent).join(",")}?${encodedQuery}`;
+}
+
+export function normalizeDraftContent(mailboxName: string, content: string): string {
+  // Native Mail drafts render without trailing whitespace, but Mail's HTML to
+  // plain-text bridge exposes the formatting newline before </body> as one
+  // terminal space. Remove only that native-composer sentinel; do not trim
+  // ordinary messages or AppleScript drafts with their distinct leading LF.
+  if (mailboxName.toLocaleLowerCase() === "drafts" && !content.startsWith("\n") && content.endsWith(" ")) {
+    return content.slice(0, -1);
+  }
+  return content;
+}
+
 const FIELD_DELIM = "|||";
 const RECORD_DELIM = "<<<>>>";
 
@@ -185,7 +231,7 @@ end tell`;
     sender: parts[2]?.trim() || "",
     date: parts[3]?.trim() || "",
     isRead: parts[4]?.trim() === "true",
-    content: parts[5] || "",
+    content: normalizeDraftContent(mailboxName, parts[5] || ""),
     toRecipients: parts[6] ? parts[6].split(",").map((s) => s.trim()).filter(Boolean) : [],
     ccRecipients: parts[7] ? parts[7].split(",").map((s) => s.trim()).filter(Boolean) : [],
   };
@@ -309,7 +355,8 @@ export async function createDraft(
   subject: string,
   body: string,
   options?: { cc?: string; bcc?: string; from?: string },
-  runner: typeof runAppleScript = runAppleScript
+  runner: typeof runAppleScript = runAppleScript,
+  urlOpener: (url: string) => Promise<void> = openMailUrl
 ): Promise<string> {
   assertAccountAllowed(options?.from);
   // Resolve the sender before creating anything, including when Mail's default is used.
@@ -339,18 +386,79 @@ end tell`);
 
   // Support multiple comma-separated recipients
   const toAddresses = to.split(",").map((a) => a.trim()).filter(Boolean);
+  const ccAddresses = options?.cc?.split(",").map((a) => a.trim()).filter(Boolean) || [];
+  const bccAddresses = options?.bcc?.split(",").map((a) => a.trim()).filter(Boolean) || [];
+
+  // Mail 16 wraps AppleScript-assigned rich text in Apple-Mail-URLShare markup.
+  // On affected accounts that adds a visible blank first line and serializes an
+  // extra trailing " \n". Mail's native mailto composer does not add that
+  // wrapper, so use it for accounts explicitly enabled for the workaround.
+  // The mailto `from` parameter is ignored by macOS Mail, hence this path is
+  // opt-in per account rather than risking a draft in the wrong account.
+  if (NATIVE_DRAFT_ACCOUNTS.has(accountName.toLocaleLowerCase())) {
+    const existingState = await runner(`
+tell application "Mail"
+  set windowIds to {}
+  if (count of windows) > 0 then set windowIds to id of every window
+  set draftMailbox to mailbox "Drafts" of account "${sanitize(accountName)}"
+  set matchingDrafts to every message of draftMailbox whose subject is "${safeSubject}"
+  return (windowIds as text) & "${FIELD_DELIM}" & (count of matchingDrafts as text)
+end tell`);
+    const stateParts = existingState.split(FIELD_DELIM);
+    if (stateParts.length !== 2) {
+      throw new Error("Cannot determine Mail state before creating draft");
+    }
+    const windowIds = stateParts[0]
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean);
+    const previousDraftCount = Number.parseInt(stateParts[1], 10);
+    if (windowIds.some((id) => !/^\d+$/.test(id)) || !Number.isSafeInteger(previousDraftCount) || previousDraftCount < 0) {
+      throw new Error("Cannot determine existing Mail windows and drafts before creating draft");
+    }
+
+    await urlOpener(buildMailtoUrl(toAddresses, subject, body, ccAddresses, bccAddresses));
+    const oldIds = windowIds.length > 0 ? `{${windowIds.join(", ")}}` : "{}";
+    await runner(`
+tell application "Mail"
+  set previousWindowIds to ${oldIds}
+  set previousDraftCount to ${previousDraftCount}
+  set draftWindow to missing value
+  repeat 40 times
+    repeat with candidateWindow in windows
+      if (id of candidateWindow) is not in previousWindowIds then
+        set draftWindow to candidateWindow
+        exit repeat
+      end if
+    end repeat
+    if draftWindow is not missing value then exit repeat
+    delay 0.25
+  end repeat
+  if draftWindow is missing value then error "Timed out waiting for Mail draft window"
+  set savedDraftFound to false
+  repeat 120 times
+    set matchingDrafts to every message of mailbox "Drafts" of account "${sanitize(accountName)}" whose subject is "${safeSubject}"
+    if (count of matchingDrafts) > previousDraftCount then set savedDraftFound to true
+    if savedDraftFound then exit repeat
+    delay 0.25
+  end repeat
+  if not savedDraftFound then error "Timed out waiting for Mail to save draft"
+  close draftWindow saving yes
+  return "Draft saved in Drafts for ${sanitize(accountName)}: ${safeSubject}"
+end tell`);
+    return `Draft saved in Drafts for ${accountName}: ${subject}`;
+  }
+
   let recipientBlock = toAddresses
     .map((addr) => `make new to recipient at end of to recipients with properties {address:"${sanitize(addr)}"}`)
     .join("\n    ");
 
-  if (options?.cc) {
-    const ccAddresses = options.cc.split(",").map((a) => a.trim()).filter(Boolean);
+  if (ccAddresses.length > 0) {
     recipientBlock += "\n    " + ccAddresses
       .map((addr) => `make new cc recipient at end of cc recipients with properties {address:"${sanitize(addr)}"}`)
       .join("\n    ");
   }
-  if (options?.bcc) {
-    const bccAddresses = options.bcc.split(",").map((a) => a.trim()).filter(Boolean);
+  if (bccAddresses.length > 0) {
     recipientBlock += "\n    " + bccAddresses
       .map((addr) => `make new bcc recipient at end of bcc recipients with properties {address:"${sanitize(addr)}"}`)
       .join("\n    ");

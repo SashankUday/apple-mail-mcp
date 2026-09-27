@@ -79,6 +79,8 @@ Use `create_draft` for composition by default. It takes `to`, `subject`, `body`,
 
 An explicit account uses its first configured email address as the sender. Omission resolves Mail's `primary email` to one account and checks it against exclusions before creating anything; an unresolved or ambiguous default requires `from_account`. This uses the dictionary's primary email, rather than Mail's context-sensitive automatic sender selection. Live testing selected `visible:false`: both modes saved successfully, but the visible multi-recipient trial included an unexpected extra recipient. Invisible drafts passed exact recipient checks and remained in Drafts after closing.
 
+Mail 16 serializes AppleScript-assigned rich text through an `Apple-Mail-URLShare` wrapper, which adds a visible blank first line. `President Email` therefore uses Mail's native `mailto:` composer and waits until the new message is observable in its Drafts mailbox before closing the compose window; this preserves paragraph breaks and bullet lines without the leading blank and avoids reporting success before Mail auto-saves. Additional accounts can opt into that path with the comma-separated `APPLE_MAIL_NATIVE_DRAFT_ACCOUNTS` environment variable, but only accounts that Mail uses as its native compose sender should be listed because macOS Mail ignores the `mailto:` `from` parameter. Other accounts retain the sender-explicit AppleScript path.
+
 `send_email` remains unchanged. Its existing `make new outgoing message of account ...` construction is inconsistent with Mail's dictionary (outgoing messages belong to the application); a separate fix should resolve the account address and set `sender`, and check default-account exclusion as drafting does.
 
 ## Saving attachments

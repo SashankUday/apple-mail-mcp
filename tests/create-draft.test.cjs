@@ -1,7 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 process.env.APPLE_MAIL_EXCLUDE_ACCOUNTS = 'Blocked Test Account';
-const { createDraft, sanitize } = require('../build/applescript.js');
+const { buildMailtoUrl, createDraft, normalizeDraftContent, sanitize } = require('../build/applescript.js');
 const { ExcludedAccountError } = require('../build/config.js');
 
 test('draft exclusion runs first without invoking runner', async () => {
@@ -63,4 +63,51 @@ test('lookup failure or invalid metadata never creates a message', async () => {
     assert.equal(calls, 1);
   }
   await assert.rejects(createDraft('a', 'b', 'c', undefined, async () => { throw new Error('lookup failed'); }), /lookup failed/);
+});
+
+test('affected account uses native Mail composer without sending', async () => {
+  const scripts = [];
+  const urls = [];
+  const body = 'Hi team,\n\n- Alpha\n- Beta\n\nRegards';
+  const result = await createDraft(
+    ' one@example.invalid, two@example.invalid ',
+    'Test & review',
+    body,
+    { from: 'President Email', cc: 'c@example.invalid', bcc: 'b@example.invalid' },
+    async script => {
+      scripts.push(script);
+      if (scripts.length === 1) return 'President Email|||president@example.invalid';
+      if (scripts.length === 2) return '101, 202|||1';
+      return 'Draft saved in Drafts for President Email: Test & review';
+    },
+    async url => { urls.push(url); }
+  );
+
+  assert.equal(urls.length, 1);
+  assert.equal(urls[0], buildMailtoUrl(
+    ['one@example.invalid', 'two@example.invalid'],
+    'Test & review',
+    body,
+    ['c@example.invalid'],
+    ['b@example.invalid']
+  ));
+  assert.match(urls[0], /^mailto:one%40example\.invalid,two%40example\.invalid\?/);
+  assert.ok(urls[0].includes('body=Hi%20team%2C%0A%0A-%20Alpha%0A-%20Beta%0A%0ARegards'));
+  assert.equal(scripts.length, 3);
+  assert.match(scripts[2], /set previousWindowIds to \{101, 202\}/);
+  assert.match(scripts[2], /set previousDraftCount to 1/);
+  assert.match(scripts[2], /if not savedDraftFound then error "Timed out waiting for Mail to save draft"/);
+  assert.match(scripts[2], /close draftWindow saving yes/);
+  for (const script of scripts) {
+    assert.doesNotMatch(script, /make new outgoing message/);
+    assert.doesNotMatch(script, /\bsend\s/);
+  }
+  assert.equal(result, 'Draft saved in Drafts for President Email: Test & review');
+});
+
+test('native draft content drops only Mail HTML bridge terminal space', () => {
+  const body = 'Hi team,\n\n- Alpha\n- Beta\n\nRegards';
+  assert.equal(normalizeDraftContent('Drafts', `${body} `), body);
+  assert.equal(normalizeDraftContent('INBOX', `${body} `), `${body} `);
+  assert.equal(normalizeDraftContent('Drafts', `\n${body} \n`), `\n${body} \n`);
 });
