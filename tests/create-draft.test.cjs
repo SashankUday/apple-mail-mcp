@@ -52,7 +52,7 @@ test('all caller and resolved values are escaped', async () => {
   await createDraft(input, input, input, { from: input, cc: input, bcc: input }, async script => {
     scripts.push(script); return scripts.length === 1 ? `${input}|||${input}` : 'ok';
   });
-  assert.ok(scripts[0].includes(`account "${sanitize(input)}"`));
+  assert.ok(scripts[0].includes(`candidateName is "${sanitize(input)}"`));
   for (const property of ['sender', 'subject', 'content', 'address']) assert.ok(scripts[1].includes(`${property}:"${sanitize(input)}"`));
 });
 

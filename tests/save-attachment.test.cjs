@@ -72,7 +72,9 @@ test('save writes exact bytes privately and removes staging', async t => {
   const mailbox = 'Inbox "quoted"\\folder\nnext';
   const account = 'Allowed "quoted"\\account';
   const result = await saveAttachment(mailbox, account, 42, name, dir, async script => {
-    assert.ok(script.includes(`mailbox "${sanitize(mailbox)}" of account "${sanitize(account)}"`));
+    assert.ok(script.includes(`candidateName is "${sanitize(account)}"`));
+    assert.ok(script.includes(`candidateMbName is "${sanitize(mailbox)}"`));
+    assert.ok(!script.includes('of account "'));
     assert.ok(script.includes('whose id is 42'));
     assert.ok(script.includes(`whose name is "${name}"`));
     assert.ok(script.includes('if not (downloaded of att)'));

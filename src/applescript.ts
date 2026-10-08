@@ -22,6 +22,78 @@ export function accountGuard(variable = "acctName"): { open: string; close: stri
   return { open: `if not (${tests}) then`, close: "end if" };
 }
 
+/**
+ * AppleScript that binds `acct` (and optionally `mb`) by walking Mail's
+ * account and mailbox lists instead of addressing them by name.
+ *
+ * Name-based specifiers such as `mailbox "Inbox" of account "University"` fail
+ * with -1728 ("Can't get account") on some Exchange accounts even though the
+ * same account appears when iterating `accounts`, and they fail for nested
+ * Gmail mailboxes such as `[Gmail]/All Mail`. Iteration yields index-based
+ * references (`item i of every account`), which resolve in both cases — the
+ * same path list_mailboxes already relies on.
+ *
+ * Matching rules:
+ * - Account names ignore case and white space, so a description with a stray
+ *   trailing space still resolves. The excluded-account check is repeated on
+ *   the resolved account with the same rules, so a loose spelling can never
+ *   reach an excluded account.
+ * - Mailbox names ignore case, so `INBOX`, `Inbox` and `inbox` resolve to the
+ *   account's real inbox on both Gmail and Exchange.
+ * - A missing account or mailbox raises an error that lists what is
+ *   available, rather than returning an empty result.
+ */
+export function resolveTargetScript(accountName: string, mailboxName?: string): string {
+  const safeAcct = sanitize(accountName.trim());
+  const excludedTest = EXCLUDED_ACCOUNTS.map((name) => `(name of acct) is "${sanitize(name)}"`).join(" or ");
+  const exclusionCheck = excludedTest
+    ? `
+  ignoring white space
+    if ${excludedTest} then error "Account \\"${safeAcct}\\" is excluded from this MCP server by configuration and cannot be read or modified."
+  end ignoring`
+    : "";
+  const accountPart = `
+  set acct to missing value
+  set acctFound to false
+  set availableAccts to {}
+  repeat with candidateAcct in accounts
+    set candidateName to name of candidateAcct
+    set end of availableAccts to candidateName
+    if not acctFound then
+      ignoring white space
+        if candidateName is "${safeAcct}" then
+          set acct to candidateAcct
+          set acctFound to true
+        end if
+      end ignoring
+    end if
+  end repeat
+  if not acctFound then
+    set AppleScript's text item delimiters to ", "
+    error "Account \\"${safeAcct}\\" not found. Available accounts: " & (availableAccts as text)
+  end if${exclusionCheck}`;
+  if (mailboxName === undefined) return accountPart;
+  const safeMb = sanitize(mailboxName.trim());
+  return `${accountPart}
+  set mb to missing value
+  set mbFound to false
+  set availableMbs to {}
+  repeat with candidateMb in mailboxes of acct
+    set candidateMbName to name of candidateMb
+    set end of availableMbs to candidateMbName
+    if not mbFound then
+      if candidateMbName is "${safeMb}" then
+        set mb to candidateMb
+        set mbFound to true
+      end if
+    end if
+  end repeat
+  if not mbFound then
+    set AppleScript's text item delimiters to ", "
+    error "Mailbox \\"${safeMb}\\" not found in account \\"${safeAcct}\\". Available mailboxes: " & (availableMbs as text)
+  end if`;
+}
+
 export function sanitize(input: string): string {
   return input
     .replace(/\\/g, "\\\\")
@@ -126,8 +198,6 @@ export async function listMessages(
   unreadOnly?: boolean
 ): Promise<{ id: number; subject: string; sender: string; date: string; isRead: boolean }[]> {
   assertAccountAllowed(accountName);
-  const safeMb = sanitize(mailboxName);
-  const safeAcct = sanitize(accountName);
   const maxMessages = limit || 25;
 
   // When filtering by unread, `whose` returns a runtime list which doesn't support
@@ -135,7 +205,7 @@ export async function listMessages(
   const script = unreadOnly
     ? `
 tell application "Mail"
-  set mb to mailbox "${safeMb}" of account "${safeAcct}"
+  ${resolveTargetScript(accountName, mailboxName)}
   set targetMsgs to messages of mb whose read status is false
   set msgCount to count of targetMsgs
   set maxCount to ${maxMessages}
@@ -151,7 +221,7 @@ tell application "Mail"
 end tell`
     : `
 tell application "Mail"
-  set mb to mailbox "${safeMb}" of account "${safeAcct}"
+  ${resolveTargetScript(accountName, mailboxName)}
   set msgCount to count of messages of mb
   set maxCount to ${maxMessages}
   if msgCount < maxCount then set maxCount to msgCount
@@ -191,11 +261,9 @@ export async function getMessage(
   ccRecipients: string[];
 }> {
   assertAccountAllowed(accountName);
-  const safeMb = sanitize(mailboxName);
-  const safeAcct = sanitize(accountName);
   const script = `
 tell application "Mail"
-  set mb to mailbox "${safeMb}" of account "${safeAcct}"
+  ${resolveTargetScript(accountName, mailboxName)}
   set matchedMsgs to (every message of mb whose id is ${messageId})
   if (count of matchedMsgs) is 0 then
     error "Message not found with id: ${messageId}"
@@ -256,7 +324,7 @@ export async function searchMessages(
     script = `
 tell application "Mail"
   set results to {}
-  set mb to mailbox "${safeMb}" of account "${safeAcct}"
+  ${resolveTargetScript(accountName, mailboxName)}
   set matchedMsgs to (every message of mb whose ${field} contains "${safeQuery}")
   set maxCount to ${maxResults}
   set msgCount to count of matchedMsgs
@@ -361,7 +429,8 @@ export async function createDraft(
   assertAccountAllowed(options?.from);
   // Resolve the sender before creating anything, including when Mail's default is used.
   const accountLookup = options?.from
-    ? `set chosenAccount to account "${sanitize(options.from.trim())}"
+    ? `${resolveTargetScript(options.from)}
+  set chosenAccount to acct
   set addresses to email addresses of chosenAccount
   if (count of addresses) is 0 then error "Account has no email address"
   set chosenAddress to item 1 of addresses`
@@ -400,7 +469,8 @@ end tell`);
 tell application "Mail"
   set windowIds to {}
   if (count of windows) > 0 then set windowIds to id of every window
-  set draftMailbox to mailbox "Drafts" of account "${sanitize(accountName)}"
+  ${resolveTargetScript(accountName, "Drafts")}
+  set draftMailbox to mb
   set matchingDrafts to every message of draftMailbox whose subject is "${safeSubject}"
   return (windowIds as text) & "${FIELD_DELIM}" & (count of matchingDrafts as text)
 end tell`);
@@ -435,9 +505,10 @@ tell application "Mail"
     delay 0.25
   end repeat
   if draftWindow is missing value then error "Timed out waiting for Mail draft window"
+  ${resolveTargetScript(accountName, "Drafts")}
   set savedDraftFound to false
   repeat 120 times
-    set matchingDrafts to every message of mailbox "Drafts" of account "${sanitize(accountName)}" whose subject is "${safeSubject}"
+    set matchingDrafts to every message of mb whose subject is "${safeSubject}"
     if (count of matchingDrafts) > previousDraftCount then set savedDraftFound to true
     if savedDraftFound then exit repeat
     delay 0.25
@@ -483,11 +554,10 @@ export async function getUnreadCount(mailboxName?: string, accountName?: string)
   let script: string;
   if (mailboxName && accountName) {
     assertAccountAllowed(accountName);
-    const safeMb = sanitize(mailboxName);
-    const safeAcct = sanitize(accountName);
     script = `
 tell application "Mail"
-  return unread count of mailbox "${safeMb}" of account "${safeAcct}"
+  ${resolveTargetScript(accountName, mailboxName)}
+  return unread count of mb
 end tell`;
   } else {
     const guard = accountGuard();
@@ -518,14 +588,13 @@ export async function moveMessage(
 ): Promise<string> {
   assertAccountAllowed(fromAccount);
   assertAccountAllowed(toAccount);
-  const safeFromMb = sanitize(fromMailbox);
-  const safeFromAcct = sanitize(fromAccount);
   const safeToMb = sanitize(toMailbox);
-  const safeToAcct = sanitize(toAccount || fromAccount);
   const script = `
 tell application "Mail"
-  set sourceMb to mailbox "${safeFromMb}" of account "${safeFromAcct}"
-  set destMb to mailbox "${safeToMb}" of account "${safeToAcct}"
+  ${resolveTargetScript(fromAccount, fromMailbox)}
+  set sourceMb to mb
+  ${resolveTargetScript(toAccount || fromAccount, toMailbox)}
+  set destMb to mb
   set matchedMsgs to (every message of sourceMb whose id is ${messageId})
   if (count of matchedMsgs) is 0 then
     error "Message not found with id: ${messageId}"
@@ -544,11 +613,9 @@ export async function markRead(
   read: boolean
 ): Promise<string> {
   assertAccountAllowed(accountName);
-  const safeMb = sanitize(mailboxName);
-  const safeAcct = sanitize(accountName);
   const script = `
 tell application "Mail"
-  set mb to mailbox "${safeMb}" of account "${safeAcct}"
+  ${resolveTargetScript(accountName, mailboxName)}
   set matchedMsgs to (every message of mb whose id is ${messageId})
   if (count of matchedMsgs) is 0 then
     error "Message not found with id: ${messageId}"
@@ -566,11 +633,9 @@ export async function deleteMessage(
   accountName: string
 ): Promise<string> {
   assertAccountAllowed(accountName);
-  const safeMb = sanitize(mailboxName);
-  const safeAcct = sanitize(accountName);
   const script = `
 tell application "Mail"
-  set mb to mailbox "${safeMb}" of account "${safeAcct}"
+  ${resolveTargetScript(accountName, mailboxName)}
   set matchedMsgs to (every message of mb whose id is ${messageId})
   if (count of matchedMsgs) is 0 then
     error "Message not found with id: ${messageId}"
@@ -589,11 +654,9 @@ export async function flagMessage(
   flagged: boolean
 ): Promise<string> {
   assertAccountAllowed(accountName);
-  const safeMb = sanitize(mailboxName);
-  const safeAcct = sanitize(accountName);
   const script = `
 tell application "Mail"
-  set mb to mailbox "${safeMb}" of account "${safeAcct}"
+  ${resolveTargetScript(accountName, mailboxName)}
   set matchedMsgs to (every message of mb whose id is ${messageId})
   if (count of matchedMsgs) is 0 then
     error "Message not found with id: ${messageId}"
@@ -614,11 +677,9 @@ export async function listAttachments(
 ): Promise<{ name: string; mimeType: string | null; size: number; downloaded: boolean }[]> {
   assertAccountAllowed(accountName);
   if (!Number.isSafeInteger(messageId) || messageId < 0) throw new Error("Invalid message id");
-  const safeMb = sanitize(mailboxName);
-  const safeAcct = sanitize(accountName);
   const script = `
 tell application "Mail"
-  set mb to mailbox "${safeMb}" of account "${safeAcct}"
+  ${resolveTargetScript(accountName, mailboxName)}
   set matchedMsgs to (every message of mb whose id is ${messageId})
   if (count of matchedMsgs) is 0 then
     error "Message not found with id: ${messageId}"
@@ -716,7 +777,7 @@ export async function saveAttachment(
     chmodSync(staging, 0o700);
     const script = `
 tell application "Mail"
-  set mb to mailbox "${sanitize(mailboxName)}" of account "${sanitize(accountName)}"
+  ${resolveTargetScript(accountName, mailboxName)}
   set matchedMsgs to (every message of mb whose id is ${messageId})
   if (count of matchedMsgs) is 0 then
     error "Message not found with id: ${messageId}"

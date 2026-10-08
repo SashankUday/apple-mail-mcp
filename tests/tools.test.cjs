@@ -32,3 +32,16 @@ test('new tools expose described schemas and return MCP errors for excluded acco
     assert.match(result.content[0].text, /excluded from this MCP server/);
   }
 });
+
+test('account and mailbox are resolved by iteration, not by name', () => {
+  const { resolveTargetScript } = require('../build/applescript.js');
+  const script = resolveTargetScript(' University ', 'INBOX');
+  assert.ok(!/ of account "/.test(script), 'no by-name account specifier');
+  assert.ok(!/mailbox "INBOX" of/.test(script), 'no by-name mailbox specifier');
+  assert.ok(script.includes('repeat with candidateAcct in accounts'));
+  assert.ok(script.includes('repeat with candidateMb in mailboxes of acct'));
+  assert.ok(script.includes('ignoring white space'));
+  assert.ok(script.includes('candidateName is "University"'), 'requested name is trimmed');
+  assert.ok(script.includes('Available mailboxes'), 'missing mailbox raises a listing error');
+  assert.ok(script.includes('Available accounts'), 'missing account raises a listing error');
+});

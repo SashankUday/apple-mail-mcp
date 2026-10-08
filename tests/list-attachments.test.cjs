@@ -14,7 +14,9 @@ test('attachment metadata preserves exact names and downloaded status', async ()
   const mailbox = 'Inbox "quoted"\\folder\nnext';
   const account = 'Allowed "quoted"\\name';
   const attachments = await listAttachments(mailbox, account, 42, async script => {
-    assert.ok(script.includes(`mailbox "${sanitize(mailbox)}" of account "${sanitize(account)}"`));
+    assert.ok(script.includes(`candidateName is "${sanitize(account)}"`));
+    assert.ok(script.includes(`candidateMbName is "${sanitize(mailbox)}"`));
+    assert.ok(!script.includes('of account "'));
     assert.ok(script.includes('whose id is 42'));
     assert.ok(script.includes('mail attachments of m'));
     assert.ok(script.includes('downloaded of att'));
