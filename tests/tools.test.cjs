@@ -14,7 +14,7 @@ test('new tools expose described schemas and return MCP errors for excluded acco
   t.after(() => client.close());
   await client.connect(transport);
   const { tools } = await client.listTools();
-  for (const name of ['create_draft', 'list_attachments', 'save_attachment']) {
+  for (const name of ['create_draft', 'create_reply_draft', 'list_attachments', 'save_attachment']) {
     const tool = tools.find(t => t.name === name);
     assert.ok(tool, name);
     for (const [field, schema] of Object.entries(tool.inputSchema.properties)) assert.ok(schema.description, `${name}.${field}`);
@@ -22,8 +22,10 @@ test('new tools expose described schemas and return MCP errors for excluded acco
   const description = tools.find(t => t.name === 'create_draft').description;
   assert.match(description, /default tool for composing mail/);
   assert.match(description, /send_email only when the user directly instructs/);
+  assert.match(description, /create_reply_draft/);
   for (const [name, args] of [
     ['create_draft', { to: 'a@example.invalid', subject: 'Test', body: 'Body', from_account: 'Blocked Test Account' }],
+    ['create_reply_draft', { message_id: 1, mailbox: 'Inbox', account: 'Blocked Test Account', body: 'Body' }],
     ['list_attachments', { message_id: 1, mailbox: 'Inbox', account: 'Blocked Test Account' }],
     ['save_attachment', { message_id: 1, mailbox: 'Inbox', account: 'Blocked Test Account', attachment_name: 'test.pdf', save_path: '/tmp' }],
   ]) {

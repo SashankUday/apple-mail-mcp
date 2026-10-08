@@ -58,7 +58,7 @@ Mail's dictionary declares outgoing messages at application scope and provides a
 
 Raw MIME inspection confirmed the cause on Mail 16: assigning `content` through AppleScript serializes the body inside an `Apple-Mail-URLShareWrapperClass` blockquote and prepends `Apple-Mail-URLShareUserContentTopClass` containing `<br>`. Creating the outgoing message first, clearing `message signature`, assigning content separately, switching temporarily to plain text, and post-save text mutation all retained that wrapper.
 
-For `President Email`, `createDraft` now opens Mail's native `mailto:` composer, captures the existing window and same-subject draft state, waits until the new draft is observable in `President Email > Drafts`, then closes the exact newly opened window. The saved native draft has no URL-share wrapper or leading HTML break. Since macOS Mail ignores a `mailto:` `from` parameter, this path is account-opt-in through `APPLE_MAIL_NATIVE_DRAFT_ACCOUNTS`; other accounts keep the sender-explicit AppleScript path rather than risk saving under the wrong account.
+For the affected account (now listed in the config file's `nativeDraftAccounts`; there is no built-in default), `createDraft` now opens Mail's native `mailto:` composer, captures the existing window and same-subject draft state, waits until the new draft is observable in that account's Drafts, then closes the exact newly opened window. The saved native draft has no URL-share wrapper or leading HTML break. Since macOS Mail ignores a `mailto:` `from` parameter, this path is account-opt-in through `APPLE_MAIL_NATIVE_DRAFT_ACCOUNTS`; other accounts keep the sender-explicit AppleScript path rather than risk saving under the wrong account.
 
 The final live test used `Hi team,\n\n- Alpha\n- Beta\n\nRegards`. `getMessage` returned an exact byte-for-byte string match, the raw MIME contained no `Apple-Mail-URLShare` marker, and the content neither began with a newline nor ended with `" \n"`. The draft was moved to Trash after verification, and no email was sent. Auto-save verification uses a stable before/after same-subject count because Mail can invalidate individual draft IDs while IMAP synchronization is in progress.
 
@@ -67,3 +67,31 @@ Four clearly labelled `[MCP TEST]` drafts were created during live checks, inclu
 `createDraft` starts with the explicit account guard and also checks the resolved account before creating a message. Sender lookup is read-only. The generated creation script uses `save newMessage`; a source grep and generated-script assertions found no `send ` command. The recipient construction is copied from `sendEmail` unchanged: each comma-delimited address deterministically becomes one `make new ... recipient` statement, with no later character-level splitting. The extra one-character row therefore was not produced by that construction. The leading hypothesis is Mail's live compose UI tokenising a transient placeholder as an additional recipient when `visible:true`; this is reasoning from the shared script and the visibility A/B result, not a confirmed root cause. Because `sendEmail` uses the same construction with `visible:false`, and invisible draft trials preserved the exact lists, the evidence suggests `sendEmail` is unaffected, but it was not live-tested by sending mail.
 
 Final automated checks also connect a real MCP client over stdio, verify all new tools and field descriptions, and exercise excluded-account error responses without invoking Mail. The default-account lookup uses the dictionary's `primary email`, not Mail's contextual automatic sender selection. It currently returns the resolved account name and primary address to the TypeScript process before the exclusion guard rejects the account. No message is created, but this means an excluded default account's own address is disclosed internally; a stricter implementation would reject inside AppleScript before returning the address.
+
+## Reply drafts
+
+`create_reply_draft` calls Mail's `reply` command (`without opening window`) on the original message, sets the reply text above any quoted original Mail provides, and saves. The generated script compiles against Mail's dictionary (`osacompile`), and automated tests cover exclusion-before-runner ordering, message-id validation, escaping, reply-all, and the absence of any `send` or `make new outgoing message`.
+
+Not yet live-tested. Open questions for the first live run: whether the saved draft shows in the original conversation in Mail and in the account's web client; whether `content` of a windowless reply includes the quoted original, and how it looks once re-assigned; and whether the leading-blank-line wrapper seen with `create_draft` also appears on accounts listed in `APPLE_MAIL_NATIVE_DRAFT_ACCOUNTS`, which have no native-composer path for replies.
+
+## Account and mailbox resolution
+
+Checked live on 8 October 2026 (macOS 27.0, 26A428) with one account excluded; only counts, paths and timings were printed, never message content. No message was created, changed or sent.
+
+`mailboxes of account` is a flat list that includes nested mailboxes under their leaf name (`All Mail` inside `[Gmail]`, `Conflicts` inside `Sync Issues`); `[Gmail]` itself is not listed. Every container reports class `container`, so the path walk stops at the first container whose `account` cannot be read, which is the account.
+
+| Check | Result |
+| --- | --- |
+| `inbox` on Exchange (`Inbox`), `Inbox` on Gmail (`INBOX`) | Passed |
+| `[Gmail]/All Mail` and bare `All Mail` | Passed for list_messages and search; previously -1728 |
+| `Sync Issues/Conflicts` on Exchange | Passed |
+| Account spelled `exchange ` | Passed |
+| Unknown mailbox | Error listing every mailbox path |
+| `list_mailboxes` | 92 rows with full paths in about 8 s; raw AppleScript output contained no row from the excluded account |
+| `get_message` without mailbox, and without account | Found Exchange and Gmail messages in their inboxes |
+| All-account subject search | Found a known Exchange inbox message, results newest first; raw AppleScript output contained no row from the excluded account. About 14 s; a scoped Exchange inbox search took about 7 s, almost all in Mail's `whose` filter |
+| All-account sender search | Found the same message; no row from the excluded account |
+| `send_email` script | Compiles against Mail's dictionary; not run, as it would send |
+| Default sender lookup | Mail's `primary email` raises -10000 on this Mac, so `create_draft` and `send_email` without `from_account` now fail with "specify from_account". The omitted-account path had only been tested with mocks |
+
+The raw-output checks are the first live evidence for the AppleScript-level exclusion in list_mailboxes and unscoped search. They show the excluded account is skipped, not that it would have matched; the controlled-message test above remains the stronger check.

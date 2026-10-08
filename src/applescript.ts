@@ -2,7 +2,7 @@ import { constants as fsConstants, chmodSync, copyFileSync, lstatSync, mkdtempSy
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { execFile } from "node:child_process";
-import { EXCLUDED_ACCOUNTS, assertAccountAllowed, filterExcluded } from "./config.js";
+import { DEFAULT_ACCOUNT, EXCLUDED_ACCOUNTS, NATIVE_DRAFT_ACCOUNTS, assertAccountAllowed, filterExcluded } from "./config.js";
 
 /**
  * AppleScript guard skipping excluded accounts inside an account loop.
@@ -40,18 +40,19 @@ export function accountGuard(variable = "acctName"): { open: string; close: stri
  *   reach an excluded account.
  * - Mailbox names ignore case, so `INBOX`, `Inbox` and `inbox` resolve to the
  *   account's real inbox on both Gmail and Exchange.
+ * - A mailbox may be given as its full path (`[Gmail]/All Mail`, as
+ *   list_mailboxes reports it) or as its leaf name (`All Mail`). `mailboxes of
+ *   acct` is flat and includes nested mailboxes under their leaf name; a leaf
+ *   name shared by several mailboxes is an error listing their paths.
  * - A missing account or mailbox raises an error that lists what is
  *   available, rather than returning an empty result.
  */
 export function resolveTargetScript(accountName: string, mailboxName?: string): string {
   const safeAcct = sanitize(accountName.trim());
-  const excludedTest = EXCLUDED_ACCOUNTS.map((name) => `(name of acct) is "${sanitize(name)}"`).join(" or ");
-  const exclusionCheck = excludedTest
-    ? `
-  ignoring white space
-    if ${excludedTest} then error "Account \\"${safeAcct}\\" is excluded from this MCP server by configuration and cannot be read or modified."
-  end ignoring`
-    : "";
+  const exclusionCheck = exclusionCheckScript(
+    "(name of acct)",
+    `"Account \\"${safeAcct}\\" is excluded from this MCP server by configuration and cannot be read or modified."`
+  );
   const accountPart = `
   set acct to missing value
   set acctFound to false
@@ -73,25 +74,106 @@ export function resolveTargetScript(accountName: string, mailboxName?: string): 
     error "Account \\"${safeAcct}\\" not found. Available accounts: " & (availableAccts as text)
   end if${exclusionCheck}`;
   if (mailboxName === undefined) return accountPart;
-  const safeMb = sanitize(mailboxName.trim());
+  const requested = mailboxName.trim();
+  const safeMb = sanitize(requested);
+  const isPath = requested.includes("/");
+  const safeLeaf = sanitize(requested.slice(requested.lastIndexOf("/") + 1));
+  // Matches keep the loop's `item i of every mailbox of acct` reference, which
+  // resolves for nested mailboxes; Mail's own by-name specifiers do not.
   return `${accountPart}
   set mb to missing value
-  set mbFound to false
-  set availableMbs to {}
+  set mbMatchCount to 0
+  set mbMatchPaths to {}
   repeat with candidateMb in mailboxes of acct
-    set candidateMbName to name of candidateMb
-    set end of availableMbs to candidateMbName
-    if not mbFound then
-      if candidateMbName is "${safeMb}" then
-        set mb to candidateMb
-        set mbFound to true
+    if (name of candidateMb) is "${safeLeaf}" then
+      ${mailboxPathScript("candidateMb", "candidateMbPath")}
+      if ${isPath ? `candidateMbPath is "${safeMb}"` : "true"} then
+        set mbMatchCount to mbMatchCount + 1
+        if mbMatchCount is 1 then set mb to candidateMb
+        set end of mbMatchPaths to candidateMbPath
       end if
     end if
   end repeat
-  if not mbFound then
+  if mbMatchCount is 0 then
+    set availableMbs to {}
+    repeat with candidateMb in mailboxes of acct
+      ${mailboxPathScript("candidateMb", "candidateMbPath")}
+      set end of availableMbs to candidateMbPath
+    end repeat
     set AppleScript's text item delimiters to ", "
     error "Mailbox \\"${safeMb}\\" not found in account \\"${safeAcct}\\". Available mailboxes: " & (availableMbs as text)
+  end if
+  if mbMatchCount > 1 then
+    set AppleScript's text item delimiters to ", "
+    error "Mailbox \\"${safeMb}\\" is ambiguous in account \\"${safeAcct}\\". Use one of: " & (mbMatchPaths as text)
   end if`;
+}
+
+/**
+ * AppleScript that sets `outVar` to the mailbox's path within its account,
+ * such as `[Gmail]/All Mail` or `Sync Issues/Conflicts`, by walking
+ * containers. The walk stops at the account, which is the first container
+ * that has no `account` of its own.
+ */
+export function mailboxPathScript(mbVar: string, outVar: string): string {
+  return `set ${outVar} to name of ${mbVar}
+  set pathCursor to ${mbVar}
+  repeat 20 times
+    try
+      set pathParent to container of pathCursor
+      get account of pathParent
+      set ${outVar} to (name of pathParent) & "/" & ${outVar}
+      set pathCursor to pathParent
+    on error
+      exit repeat
+    end try
+  end repeat`;
+}
+
+/**
+ * AppleScript raising `errorExpr` when the account name in `nameExpr` is
+ * excluded, with the same case- and white-space-insensitive rules as the
+ * resolver. Empty when nothing is excluded.
+ */
+function exclusionCheckScript(nameExpr: string, errorExpr: string): string {
+  if (EXCLUDED_ACCOUNTS.length === 0) return "";
+  const tests = EXCLUDED_ACCOUNTS.map((name) => `${nameExpr} is "${sanitize(name)}"`).join(" or ");
+  return `
+  ignoring white space
+    if ${tests} then error ${errorExpr}
+  end ignoring`;
+}
+
+/**
+ * AppleScript binding `chosenAccount` and `chosenAddress` for a new outgoing
+ * message: the named account's first address (callers pass the config file's
+ * default account when none is named), or the account owning Mail's
+ * `primary email`. A resolved default that is excluded raises inside
+ * AppleScript, so its name and address never reach this process.
+ */
+function senderLookupScript(from?: string): string {
+  if (from) {
+    return `${resolveTargetScript(from)}
+  set chosenAccount to acct
+  set addresses to email addresses of chosenAccount
+  if (count of addresses) is 0 then error "Account has no email address"
+  set chosenAddress to item 1 of addresses`;
+  }
+  // `primary email` raises -10000 on some macOS 27 setups; say what to do.
+  return `try
+    set chosenAddress to primary email
+  on error
+    error "Mail did not report a default account; specify from_account"
+  end try
+  set matchingAccounts to {}
+  repeat with acct in accounts
+    if (email addresses of acct) contains chosenAddress then set end of matchingAccounts to acct
+  end repeat
+  if (count of matchingAccounts) is not 1 then error "Cannot resolve default account; specify from_account"
+  set chosenAccount to item 1 of matchingAccounts${exclusionCheckScript(
+    "(name of chosenAccount)",
+    `"The default account is excluded from this MCP server by configuration; specify from_account."`
+  )}`;
 }
 
 export function sanitize(input: string): string {
@@ -127,12 +209,7 @@ function openMailUrl(url: string): Promise<void> {
   });
 }
 
-const NATIVE_DRAFT_ACCOUNTS = new Set(
-  (process.env.APPLE_MAIL_NATIVE_DRAFT_ACCOUNTS || "President Email")
-    .split(",")
-    .map((name) => name.trim().toLocaleLowerCase())
-    .filter(Boolean)
-);
+const NATIVE_DRAFT_KEYS = new Set(NATIVE_DRAFT_ACCOUNTS.map((name) => name.toLocaleLowerCase()));
 
 export function buildMailtoUrl(
   to: string[],
@@ -155,7 +232,9 @@ export function normalizeDraftContent(mailboxName: string, content: string): str
   // plain-text bridge exposes the formatting newline before </body> as one
   // terminal space. Remove only that native-composer sentinel; do not trim
   // ordinary messages or AppleScript drafts with their distinct leading LF.
-  if (mailboxName.toLocaleLowerCase() === "drafts" && !content.startsWith("\n") && content.endsWith(" ")) {
+  // Compare the leaf, so Gmail's nested `[Gmail]/Drafts` counts as Drafts too.
+  const leaf = mailboxName.slice(mailboxName.lastIndexOf("/") + 1);
+  if (leaf.toLocaleLowerCase() === "drafts" && !content.startsWith("\n") && content.endsWith(" ")) {
     return content.slice(0, -1);
   }
   return content;
@@ -164,8 +243,11 @@ export function normalizeDraftContent(mailboxName: string, content: string): str
 const FIELD_DELIM = "|||";
 const RECORD_DELIM = "<<<>>>";
 
-export async function listMailboxes(): Promise<{ name: string; account: string; unreadCount: number }[]> {
+export async function listMailboxes(
+  runner: typeof runAppleScript = runAppleScript
+): Promise<{ name: string; account: string; unreadCount: number }[]> {
   const guard = accountGuard();
+  // Names are full paths (`[Gmail]/All Mail`), which every other tool accepts.
   const script = `
 tell application "Mail"
   set mbList to {}
@@ -173,7 +255,7 @@ tell application "Mail"
     set acctName to name of acct
     ${guard.open}
     repeat with mb in mailboxes of acct
-      set mbName to name of mb
+      ${mailboxPathScript("mb", "mbName")}
       set mbUnread to unread count of mb
       set end of mbList to mbName & "${FIELD_DELIM}" & acctName & "${FIELD_DELIM}" & (mbUnread as text)
     end repeat
@@ -182,7 +264,7 @@ tell application "Mail"
   set AppleScript's text item delimiters to "${RECORD_DELIM}"
   return mbList as text
 end tell`;
-  const raw = await runAppleScript(script);
+  const raw = await runner(script);
   if (!raw) return [];
   const rows = raw.split(RECORD_DELIM).map((record) => {
     const [name, account, unreadCount] = record.split(FIELD_DELIM).map((s) => s.trim());
@@ -247,9 +329,10 @@ end tell`;
 }
 
 export async function getMessage(
-  mailboxName: string,
-  accountName: string,
-  messageId: number
+  mailboxName: string | undefined,
+  accountName: string | undefined,
+  messageId: number,
+  runner: typeof runAppleScript = runAppleScript
 ): Promise<{
   id: number;
   subject: string;
@@ -259,16 +342,60 @@ export async function getMessage(
   content: string;
   toRecipients: string[];
   ccRecipients: string[];
+  mailbox: string;
+  account: string;
 }> {
   assertAccountAllowed(accountName);
-  const script = `
-tell application "Mail"
-  ${resolveTargetScript(accountName, mailboxName)}
+  if (!Number.isSafeInteger(messageId) || messageId < 0) throw new Error("Invalid message id");
+  if (mailboxName && !accountName) throw new Error("A mailbox can only be given together with its account");
+
+  // Without a mailbox, look through the account's mailboxes (every allowed
+  // account's, without an account), inboxes first. Gmail also lists inbox
+  // messages under labels such as [Gmail]/Important, where moving or deleting
+  // only removes a label, so the inbox copy is the one to report.
+  let locate: string;
+  if (mailboxName && accountName) {
+    locate = `${resolveTargetScript(accountName, mailboxName)}
   set matchedMsgs to (every message of mb whose id is ${messageId})
   if (count of matchedMsgs) is 0 then
     error "Message not found with id: ${messageId}"
   end if
-  set m to item 1 of matchedMsgs
+  set m to item 1 of matchedMsgs`;
+  } else {
+    const guard = accountGuard();
+    const search = `
+    repeat with searchPass from 1 to 2
+      repeat with candidateMb in mailboxes of acct
+        set isInbox to ((name of candidateMb) is "INBOX")
+        if (searchPass is 1 and isInbox) or (searchPass is 2 and not isInbox) then
+          try
+            set matchedMsgs to (every message of candidateMb whose id is ${messageId})
+            if (count of matchedMsgs) > 0 then
+              set m to item 1 of matchedMsgs
+              set mb to candidateMb
+              set foundAcct to acct
+            end if
+          end try
+        end if
+        if m is not missing value then exit repeat
+      end repeat
+      if m is not missing value then exit repeat
+    end repeat`;
+    locate = `set m to missing value
+  ${accountName ? `${resolveTargetScript(accountName)}${search}` : `repeat with acct in accounts
+    set acctName to name of acct
+    ${guard.open}${search}
+    ${guard.close}
+    if m is not missing value then exit repeat
+  end repeat`}
+  if m is missing value then error "Message not found with id: ${messageId}"
+  set acct to foundAcct`;
+  }
+
+  const script = `
+tell application "Mail"
+  ${locate}
+  ${mailboxPathScript("mb", "mbPath")}
   set mId to id of m
   set mSubject to subject of m
   set mSender to sender of m
@@ -289,19 +416,25 @@ tell application "Mail"
   end repeat
   set ccString to ccList as text
 
-  return (mId as text) & "${RECORD_DELIM}" & mSubject & "${RECORD_DELIM}" & mSender & "${RECORD_DELIM}" & mDate & "${RECORD_DELIM}" & (mRead as text) & "${RECORD_DELIM}" & mContent & "${RECORD_DELIM}" & toString & "${RECORD_DELIM}" & ccString
+  return (mId as text) & "${RECORD_DELIM}" & mSubject & "${RECORD_DELIM}" & mSender & "${RECORD_DELIM}" & mDate & "${RECORD_DELIM}" & (mRead as text) & "${RECORD_DELIM}" & mContent & "${RECORD_DELIM}" & toString & "${RECORD_DELIM}" & ccString & "${RECORD_DELIM}" & mbPath & "${RECORD_DELIM}" & (name of acct)
 end tell`;
-  const raw = await runAppleScript(script);
+  const raw = await runner(script);
   const parts = raw.split(RECORD_DELIM);
+  const mailbox = parts[8]?.trim() || mailboxName || "";
+  const account = parts[9]?.trim() || accountName || "";
+  // Defence in depth: the script already skipped or rejected excluded accounts.
+  assertAccountAllowed(account);
   return {
     id: parseInt(parts[0]?.trim() || "0", 10),
     subject: parts[1]?.trim() || "",
     sender: parts[2]?.trim() || "",
     date: parts[3]?.trim() || "",
     isRead: parts[4]?.trim() === "true",
-    content: normalizeDraftContent(mailboxName, parts[5] || ""),
+    content: normalizeDraftContent(mailbox, parts[5] || ""),
     toRecipients: parts[6] ? parts[6].split(",").map((s) => s.trim()).filter(Boolean) : [],
     ccRecipients: parts[7] ? parts[7].split(",").map((s) => s.trim()).filter(Boolean) : [],
+    mailbox,
+    account,
   };
 }
 
@@ -310,74 +443,101 @@ export async function searchMessages(
   mailboxName?: string,
   accountName?: string,
   limit?: number,
-  searchField?: "subject" | "sender"
+  searchField?: "subject" | "sender",
+  runner: typeof runAppleScript = runAppleScript
 ): Promise<{ id: number; subject: string; sender: string; date: string; mailbox: string; account: string }[]> {
   const safeQuery = sanitize(query);
   const maxResults = limit || 25;
   const field = searchField === "sender" ? "sender" : "subject";
+  if (mailboxName && !accountName) throw new Error("A mailbox can only be given together with its account");
+  assertAccountAllowed(accountName);
+
+  // Collect the newest matches of one mailbox `mb` in account `acct`. Mail
+  // lists messages newest first, so the first ${maxResults} matches of each
+  // mailbox include every match that can make the overall top ${maxResults}.
+  // The `whose` filter is the expensive step (seconds on a large Exchange
+  // inbox), so it runs once per mailbox and only the kept matches are read.
+  // A message already collected for this account (Gmail lists one message
+  // under several labels) is skipped.
+  const collect = `
+      set matchedMsgs to (every message of mb whose ${field} contains "${safeQuery}")
+      set matchCount to count of matchedMsgs
+      if matchCount > 0 then
+        ${mailboxPathScript("mb", "mbPath")}
+        set takeCount to 0
+        repeat with i from 1 to matchCount
+          if takeCount >= ${maxResults} then exit repeat
+          set m to item i of matchedMsgs
+          set matchId to id of m
+          if seenIds does not contain matchId then
+            set end of seenIds to matchId
+            set takeCount to takeCount + 1
+            set dateText to ""
+            set sortText to ""
+            try
+              set matchDate to date sent of m
+              set dateText to matchDate as text
+              set sortText to matchDate as «class isot» as string
+            end try
+            set end of results to (matchId as text) & "${FIELD_DELIM}" & (subject of m) & "${FIELD_DELIM}" & (sender of m) & "${FIELD_DELIM}" & dateText & "${FIELD_DELIM}" & mbPath & "${FIELD_DELIM}" & (name of acct) & "${FIELD_DELIM}" & sortText
+          end if
+        end repeat
+      end if`;
 
   let script: string;
   if (mailboxName && accountName) {
-    assertAccountAllowed(accountName);
-    const safeMb = sanitize(mailboxName);
-    const safeAcct = sanitize(accountName);
     script = `
 tell application "Mail"
   set results to {}
-  ${resolveTargetScript(accountName, mailboxName)}
-  set matchedMsgs to (every message of mb whose ${field} contains "${safeQuery}")
-  set maxCount to ${maxResults}
-  set msgCount to count of matchedMsgs
-  if msgCount < maxCount then set maxCount to msgCount
-  repeat with i from 1 to maxCount
-    set m to item i of matchedMsgs
-    set end of results to (id of m as text) & "${FIELD_DELIM}" & subject of m & "${FIELD_DELIM}" & sender of m & "${FIELD_DELIM}" & (date sent of m as text) & "${FIELD_DELIM}" & "${safeMb}" & "${FIELD_DELIM}" & "${safeAcct}"
-  end repeat
+  set seenIds to {}
+  ${resolveTargetScript(accountName, mailboxName)}${collect}
   set AppleScript's text item delimiters to "${RECORD_DELIM}"
   return results as text
 end tell`;
   } else {
+    // One unreadable mailbox (common among Exchange's calendar, contacts and
+    // sync folders) is skipped instead of aborting the whole search.
     const guard = accountGuard();
+    const perAccount = `
+    set seenIds to {}
+    repeat with mb in mailboxes of acct
+      try${collect}
+      end try
+    end repeat`;
     script = `
 tell application "Mail"
   set results to {}
-  set resultCount to 0
-  repeat with acct in accounts
+  ${accountName ? `${resolveTargetScript(accountName)}${perAccount}` : `repeat with acct in accounts
     set acctName to name of acct
-    ${guard.open}
-    repeat with mb in mailboxes of acct
-      set mbName to name of mb
-      set matchedMsgs to (every message of mb whose ${field} contains "${safeQuery}")
-      repeat with m in matchedMsgs
-        if resultCount >= ${maxResults} then exit repeat
-        set end of results to (id of m as text) & "${FIELD_DELIM}" & subject of m & "${FIELD_DELIM}" & sender of m & "${FIELD_DELIM}" & (date sent of m as text) & "${FIELD_DELIM}" & mbName & "${FIELD_DELIM}" & acctName
-        set resultCount to resultCount + 1
-      end repeat
-      if resultCount >= ${maxResults} then exit repeat
-    end repeat
+    ${guard.open}${perAccount}
     ${guard.close}
-    if resultCount >= ${maxResults} then exit repeat
-  end repeat
+  end repeat`}
   set AppleScript's text item delimiters to "${RECORD_DELIM}"
   return results as text
 end tell`;
   }
-  const raw = await runAppleScript(script);
+  const raw = await runner(script);
   if (!raw) return [];
   const rows = raw.split(RECORD_DELIM).map((record) => {
-    const [id, subject, sender, date, mailbox, account] = record.split(FIELD_DELIM).map((s) => s.trim());
-    return { id: parseInt(id, 10), subject, sender, date, mailbox, account };
+    const [id, subject, sender, date, mailbox, account, sortKey] = record.split(FIELD_DELIM).map((s) => s.trim());
+    return { id: parseInt(id, 10), subject, sender, date, mailbox, account, sortKey: sortKey || "" };
   });
-  return filterExcluded(rows);
+  // Newest first across every mailbox and account, then the overall limit.
+  rows.sort((a, b) => (a.sortKey < b.sortKey ? 1 : a.sortKey > b.sortKey ? -1 : 0));
+  return filterExcluded(rows)
+    .slice(0, maxResults)
+    .map(({ sortKey: _sortKey, ...row }) => row);
 }
 
 export async function sendEmail(
   to: string,
   subject: string,
   body: string,
-  options?: { cc?: string; bcc?: string; from?: string }
+  options?: { cc?: string; bcc?: string; from?: string },
+  runner: typeof runAppleScript = runAppleScript
 ): Promise<string> {
-  assertAccountAllowed(options?.from);
+  const from = options?.from?.trim() || DEFAULT_ACCOUNT;
+  assertAccountAllowed(from);
   const safeSubject = sanitize(subject);
   const safeBody = sanitize(body);
 
@@ -400,22 +560,21 @@ export async function sendEmail(
       .join("\n    ");
   }
 
-  let accountPart = "";
-  if (options?.from) {
-    const safeFrom = sanitize(options.from);
-    accountPart = ` of account "${safeFrom}"`;
-  }
-
+  // Mail's dictionary has no outgoing messages inside an account, so the
+  // sender is chosen the way createDraft does it: the account's address in
+  // the `sender` property. An excluded default account fails before anything
+  // is created.
   const script = `
 tell application "Mail"
-  set newMessage to make new outgoing message${accountPart} with properties {subject:"${safeSubject}", content:"${safeBody}", visible:false}
+  ${senderLookupScript(from)}
+  set newMessage to make new outgoing message with properties {sender:chosenAddress, subject:"${safeSubject}", content:"${safeBody}", visible:false}
   tell newMessage
     ${recipientBlock}
   end tell
   send newMessage
-  return "Email sent to ${sanitize(to)}: ${safeSubject}"
+  return "Email sent from " & (name of chosenAccount) & " to ${sanitize(to)}: ${safeSubject}"
 end tell`;
-  return runAppleScript(script);
+  return runner(script);
 }
 
 export async function createDraft(
@@ -426,21 +585,10 @@ export async function createDraft(
   runner: typeof runAppleScript = runAppleScript,
   urlOpener: (url: string) => Promise<void> = openMailUrl
 ): Promise<string> {
-  assertAccountAllowed(options?.from);
+  const from = options?.from?.trim() || DEFAULT_ACCOUNT;
+  assertAccountAllowed(from);
   // Resolve the sender before creating anything, including when Mail's default is used.
-  const accountLookup = options?.from
-    ? `${resolveTargetScript(options.from)}
-  set chosenAccount to acct
-  set addresses to email addresses of chosenAccount
-  if (count of addresses) is 0 then error "Account has no email address"
-  set chosenAddress to item 1 of addresses`
-    : `set chosenAddress to primary email
-  set matchingAccounts to {}
-  repeat with acct in accounts
-    if (email addresses of acct) contains chosenAddress then set end of matchingAccounts to acct
-  end repeat
-  if (count of matchingAccounts) is not 1 then error "Cannot resolve default account; specify from_account"
-  set chosenAccount to item 1 of matchingAccounts`;
+  const accountLookup = senderLookupScript(from);
   const resolved = await runner(`
 tell application "Mail"
   ${accountLookup}
@@ -464,7 +612,7 @@ end tell`);
   // wrapper, so use it for accounts explicitly enabled for the workaround.
   // The mailto `from` parameter is ignored by macOS Mail, hence this path is
   // opt-in per account rather than risking a draft in the wrong account.
-  if (NATIVE_DRAFT_ACCOUNTS.has(accountName.toLocaleLowerCase())) {
+  if (NATIVE_DRAFT_KEYS.has(accountName.toLocaleLowerCase())) {
     const existingState = await runner(`
 tell application "Mail"
   set windowIds to {}
@@ -548,6 +696,54 @@ tell application "Mail"
   return "Draft saved in Drafts for ${sanitize(accountName)}: ${safeSubject}"
 end tell`;
   return runner(script);
+}
+
+/**
+ * Save an unsent reply to an existing message as a draft.
+ *
+ * Uses Mail's `reply` command rather than a new outgoing message, so the draft
+ * carries the `Re:` subject and the In-Reply-To/References headers that keep it
+ * in the original conversation in Mail, Gmail and Outlook. Mail chooses the
+ * sender from the account that received the original.
+ *
+ * Any quoted original Mail places in the reply is kept below the new text.
+ */
+export async function createReplyDraft(
+  mailboxName: string,
+  accountName: string,
+  messageId: number,
+  body: string,
+  options?: { replyAll?: boolean },
+  runner: typeof runAppleScript = runAppleScript
+): Promise<string> {
+  assertAccountAllowed(accountName);
+  if (!Number.isSafeInteger(messageId) || messageId < 0) throw new Error("Invalid message id");
+  const safeBody = sanitize(body);
+  const script = `
+tell application "Mail"
+  ${resolveTargetScript(accountName, mailboxName)}
+  set matchedMsgs to (every message of mb whose id is ${messageId})
+  if (count of matchedMsgs) is 0 then
+    error "Message not found with id: ${messageId}"
+  end if
+  set originalMsg to item 1 of matchedMsgs
+  set replyMsg to reply originalMsg opening window false reply to all ${options?.replyAll ? "true" : "false"}
+  set quotedText to ""
+  try
+    set quotedText to content of replyMsg
+  end try
+  if quotedText is missing value then set quotedText to ""
+  if quotedText is "" then
+    set content of replyMsg to "${safeBody}"
+  else
+    set content of replyMsg to "${safeBody}" & linefeed & linefeed & quotedText
+  end if
+  save replyMsg
+  return (subject of replyMsg) & "${FIELD_DELIM}" & (sender of replyMsg)
+end tell`;
+  const result = await runner(script);
+  const [subject, sender] = result.split(FIELD_DELIM);
+  return `Reply draft saved in Drafts${sender ? ` from ${sender}` : ""}: ${subject}`;
 }
 
 export async function getUnreadCount(mailboxName?: string, accountName?: string): Promise<number> {

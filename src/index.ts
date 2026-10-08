@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import * as applescript from "./applescript.js";
-import { EXCLUDED_ACCOUNTS } from "./config.js";
+import { DEFAULT_ACCOUNT, EXCLUDED_ACCOUNTS, NATIVE_DRAFT_ACCOUNTS } from "./config.js";
 
 const server = new McpServer({
   name: "apple-mail",
@@ -14,7 +14,7 @@ const server = new McpServer({
 server.registerTool(
   "list_mailboxes",
   {
-    description: "List all mailboxes across all accounts with unread counts",
+    description: "List all mailboxes across all accounts with unread counts. Nested mailboxes are reported by full path (e.g. '[Gmail]/All Mail'); pass names back exactly as listed.",
     inputSchema: z.object({}),
   },
   async () => {
@@ -33,7 +33,7 @@ server.registerTool(
   {
     description: "List recent messages in a mailbox, optionally filtered to unread only",
     inputSchema: z.object({
-      mailbox: z.string().describe("Name of the mailbox (e.g. 'INBOX')"),
+      mailbox: z.string().describe("Mailbox name or path from list_mailboxes (e.g. 'INBOX', '[Gmail]/All Mail'); case-insensitive"),
       account: z.string().describe("Name of the email account"),
       limit: z.number().optional().describe("Maximum number of messages to return (default 25)"),
       unread_only: z.boolean().optional().describe("When true, only return unread messages"),
@@ -53,10 +53,10 @@ server.registerTool(
 server.registerTool(
   "get_message",
   {
-    description: "Get the full content of an email message by ID",
+    description: "Get the full content of an email message by ID. The result includes the mailbox and account where it was found, for use with other tools.",
     inputSchema: z.object({
-      mailbox: z.string().describe("Name of the mailbox"),
-      account: z.string().describe("Name of the email account"),
+      mailbox: z.string().optional().describe("Mailbox name or path containing the message; if omitted, the account's mailboxes are searched, inbox first"),
+      account: z.string().optional().describe("Name of the email account; if omitted, all accounts are searched (required when mailbox is given)"),
       message_id: z.number().describe("ID of the message to retrieve"),
     }),
   },
@@ -74,11 +74,11 @@ server.registerTool(
 server.registerTool(
   "search_messages",
   {
-    description: "Search emails by subject or sender across mailboxes",
+    description: "Search emails by subject or sender. Results are newest first across all searched mailboxes and accounts, each with its mailbox path and account.",
     inputSchema: z.object({
       query: z.string().describe("Text to search for in email subjects or sender"),
-      mailbox: z.string().optional().describe("Mailbox to search in (searches all if omitted)"),
-      account: z.string().optional().describe("Account to search in (required if mailbox is specified)"),
+      mailbox: z.string().optional().describe("Mailbox name or path to search in (searches every mailbox if omitted)"),
+      account: z.string().optional().describe("Account to search in (searches every account if omitted; required if mailbox is specified)"),
       limit: z.number().optional().describe("Maximum number of results (default 25)"),
       search_field: z.enum(["subject", "sender"]).optional().describe("Field to search: 'subject' (default) or 'sender'"),
     }),
@@ -97,14 +97,14 @@ server.registerTool(
 server.registerTool(
   "create_draft",
   {
-    description: "Create and save an unsent draft for review in Apple Mail. This is the default tool for composing mail. Use send_email only when the user directly instructs you to send.",
+    description: "Create and save an unsent draft for review in Apple Mail. This is the default tool for composing mail. Use send_email only when the user directly instructs you to send. To answer an existing email, use create_reply_draft instead so the reply stays in the same thread.",
     inputSchema: z.object({
       to: z.string().describe("Recipient email address (comma-separated for multiple recipients)"),
       subject: z.string().describe("Email subject"),
       body: z.string().describe("Email body text"),
       cc: z.string().optional().describe("CC recipient email address (comma-separated for multiple)"),
       bcc: z.string().optional().describe("BCC recipient email address (comma-separated for multiple)"),
-      from_account: z.string().optional().describe("Mail account name for the draft (uses the primary email account if omitted)"),
+      from_account: z.string().optional().describe("Mail account name for the draft. If omitted, the defaultAccount from the server's config file is used, or else Mail's primary email account"),
     }),
   },
   async ({ to, subject, body, cc, bcc, from_account }) => {
@@ -114,6 +114,29 @@ server.registerTool(
         bcc,
         from: from_account,
       });
+      return { content: [{ type: "text", text: result }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+// ---- create_reply_draft ----
+server.registerTool(
+  "create_reply_draft",
+  {
+    description: "Save an unsent reply to an existing email as a draft for review in Apple Mail. The draft is threaded with the original message (Re: subject and reply headers), unlike create_draft, which always starts a new conversation. Use this whenever the user wants to answer an email. It never sends.",
+    inputSchema: z.object({
+      message_id: z.number().describe("ID of the message to reply to (from list_messages or search_messages)"),
+      mailbox: z.string().describe("Name of the mailbox containing the message (e.g. 'INBOX')"),
+      account: z.string().describe("Name of the email account containing the message"),
+      body: z.string().describe("Reply text, placed above any quoted original"),
+      reply_all: z.boolean().optional().describe("When true, reply to the sender and all other recipients (default false)"),
+    }),
+  },
+  async ({ message_id, mailbox, account, body, reply_all }) => {
+    try {
+      const result = await applescript.createReplyDraft(mailbox, account, message_id, body, { replyAll: reply_all });
       return { content: [{ type: "text", text: result }] };
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
@@ -132,7 +155,7 @@ server.registerTool(
       body: z.string().describe("Email body text"),
       cc: z.string().optional().describe("CC recipient email address (comma-separated for multiple)"),
       bcc: z.string().optional().describe("BCC recipient email address (comma-separated for multiple)"),
-      from_account: z.string().optional().describe("Account to send from (uses default if omitted)"),
+      from_account: z.string().optional().describe("Mail account name to send from. If omitted, the defaultAccount from the server's config file is used, or else Mail's primary email account"),
     }),
   },
   async ({ to, subject, body, cc, bcc, from_account }) => {
@@ -313,6 +336,8 @@ async function main() {
   } else {
     console.error("No account exclusions configured.");
   }
+  console.error(DEFAULT_ACCOUNT ? `Default sending account: ${DEFAULT_ACCOUNT}` : "No default sending account configured; using Mail's primary email.");
+  if (NATIVE_DRAFT_ACCOUNTS.length > 0) console.error(`Native-composer draft accounts: ${NATIVE_DRAFT_ACCOUNTS.join(", ")}`);
 }
 
 main().catch((err) => {

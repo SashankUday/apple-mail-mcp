@@ -14,7 +14,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
-    "test": "npm run build && node --test tests/*.test.cjs",
+    "test": "npm run build && HOME=\"$(mktemp -d)\" node --test tests/*.test.cjs",
     "test:clean": "npm test",
     "prepublishOnly": "npm run build"
   },

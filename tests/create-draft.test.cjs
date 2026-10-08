@@ -1,6 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 process.env.APPLE_MAIL_EXCLUDE_ACCOUNTS = 'Blocked Test Account';
+process.env.APPLE_MAIL_NATIVE_DRAFT_ACCOUNTS = 'Native Test Account';
 const { buildMailtoUrl, createDraft, normalizeDraftContent, sanitize } = require('../build/applescript.js');
 const { ExcludedAccountError } = require('../build/config.js');
 
@@ -73,12 +74,12 @@ test('affected account uses native Mail composer without sending', async () => {
     ' one@example.invalid, two@example.invalid ',
     'Test & review',
     body,
-    { from: 'President Email', cc: 'c@example.invalid', bcc: 'b@example.invalid' },
+    { from: 'Native Test Account', cc: 'c@example.invalid', bcc: 'b@example.invalid' },
     async script => {
       scripts.push(script);
-      if (scripts.length === 1) return 'President Email|||president@example.invalid';
+      if (scripts.length === 1) return 'Native Test Account|||native@example.invalid';
       if (scripts.length === 2) return '101, 202|||1';
-      return 'Draft saved in Drafts for President Email: Test & review';
+      return 'Draft saved in Drafts for Native Test Account: Test & review';
     },
     async url => { urls.push(url); }
   );
@@ -102,7 +103,7 @@ test('affected account uses native Mail composer without sending', async () => {
     assert.doesNotMatch(script, /make new outgoing message/);
     assert.doesNotMatch(script, /\bsend\s/);
   }
-  assert.equal(result, 'Draft saved in Drafts for President Email: Test & review');
+  assert.equal(result, 'Draft saved in Drafts for Native Test Account: Test & review');
 });
 
 test('native draft content drops only Mail HTML bridge terminal space', () => {
